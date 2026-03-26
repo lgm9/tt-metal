@@ -171,6 +171,12 @@ CoreRangeSet num_cores_to_corerangeset_in_subcoregrids(
     uint32_t remaining_cores = target_num_cores;
 
     auto process_row_wise = [&](const CoreRange& subcoregrid) {
+        if (subcoregrid.size() == 1 && remaining_cores > 0) {
+            result_coreranges.push_back(CoreRange(subcoregrid.start_coord, subcoregrid.end_coord));
+            remaining_cores -= 1;
+            return;
+        }
+
         uint32_t subcoregrid_width = subcoregrid.grid_size().x;
 
         for (uint32_t y = current_start_core.y; y <= subcoregrid.end_coord.y; ++y) {
@@ -206,6 +212,12 @@ CoreRangeSet num_cores_to_corerangeset_in_subcoregrids(
     };
 
     auto process_col_wise = [&](const CoreRange& subcoregrid) {
+        if (subcoregrid.size() == 1 && remaining_cores > 0) {
+            result_coreranges.push_back(CoreRange(subcoregrid.start_coord, subcoregrid.end_coord));
+            remaining_cores -= 1;
+            return;
+        }
+
         uint32_t subcoregrid_height = subcoregrid.grid_size().y;
 
         for (uint32_t x = current_start_core.x; x <= subcoregrid.end_coord.x; ++x) {
@@ -261,7 +273,6 @@ CoreRangeSet num_cores_to_corerangeset_in_subcoregrids(
     }
 
     TT_FATAL(remaining_cores == 0, "Failed to split target number of cores into CoreRangeSet");
-
     return CoreRangeSet(std::move(result_coreranges));
 }
 
@@ -404,7 +415,7 @@ std::tuple<uint32_t, CoreRangeSet, CoreRangeSet, CoreRangeSet, uint32_t, uint32_
             // Start in the next column
             else {
                 core_group_2 = num_cores_to_corerangeset_in_subcoregrids(
-                    {last_core_group_1.x + 1, range_containing_last_core_group_1.end_coord.y},
+                    {last_core_group_1.x + 1, range_containing_last_core_group_1.start_coord.y},
                     num_core_group_2_cores,
                     core_grid,
                     row_wise);
