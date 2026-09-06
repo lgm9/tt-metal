@@ -15,6 +15,9 @@
 
 #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
 
+// Spatial partition (SwiftNPU mechanism): first compute row of the active partition, 0 when none.
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::experimental::prim {
 
 namespace {
@@ -48,7 +51,8 @@ std::pair<std::vector<CoreCoord>, uint32_t> build_core_order_for_axis(
     uint32_t axis_length,
     tt::tt_metal::NOC noc,
     bool axis_is_x_when_not_transposed,
-    const CoreCoord& initial_endpoint) {
+    const CoreCoord& initial_endpoint,
+    size_t y_origin) {
     std::vector<CoreCoord> order;
     order.reserve(axis_length);
     order.push_back(initial_endpoint);
@@ -60,13 +64,17 @@ std::pair<std::vector<CoreCoord>, uint32_t> build_core_order_for_axis(
     // Direction along the axis: increasing for NOC_0, decreasing for NOC_1
     const bool increasing = (noc == tt::tt_metal::NOC::NOC_0);
 
+    // The coordinate walked along this axis starts at y_origin when it is y (partition row offset), else 0.
+    const bool modifies_y = transpose_core_grid ? axis_is_x_when_not_transposed : !axis_is_x_when_not_transposed;
+    const size_t origin = modifies_y ? y_origin : 0;
+
     uint32_t index_of_current = 0;  // default to 0 if axis_length == 1
     for (uint32_t worker_idx = 1; worker_idx < axis_length; ++worker_idx) {
         CoreCoord worker_core = core;
         size_t& coord_to_modify = transpose_core_grid ? (axis_is_x_when_not_transposed ? worker_core.y : worker_core.x)
                                                       : (axis_is_x_when_not_transposed ? worker_core.x : worker_core.y);
 
-        coord_to_modify = increasing ? worker_idx : (axis_length - worker_idx);
+        coord_to_modify = origin + (increasing ? worker_idx : (axis_length - worker_idx));
         if (coord_to_modify == current_axis_value) {
             index_of_current = worker_idx;
         }
@@ -140,7 +148,10 @@ MinimalMatmulProgramFactory::shared_variables_t minimal_matmul_factory_helper_co
 
     auto grid_size =
         config.has_value() ? config.value().compute_with_storage_grid_size : device->compute_with_storage_grid_size();
-    auto core_grid = CoreRange({0, 0}, {grid_size.x - 1, grid_size.y - 1});
+    // Place the grid at the active spatial partition's first row (y0 == 0 without a partition), so the
+    // in-kernel multicast targets computed below from these logical cores land inside the partition.
+    const uint32_t y0 = tt_get_spatial_compute_grid_y_start();
+    auto core_grid = CoreRange({0, y0}, {grid_size.x - 1, y0 + grid_size.y - 1});
     auto num_cores = core_grid.size();
 
     bool use_bias = bias_tensor.has_value();
@@ -279,12 +290,12 @@ MinimalMatmulProgramFactory::shared_variables_t minimal_matmul_factory_helper_co
     uint32_t interm_cb_num_tiles = out_block_num_tiles;  // not double buffered
     uint32_t in2_cb_num_tiles = in2_block_num_tiles;     // not double buffered
 
-    auto core_0_0 = CoreCoord{0, 0};
-    auto core_0_1 = CoreCoord{0, 1};
-    auto core_1_0 = CoreCoord{1, 0};
-    auto core_endx_0 = CoreCoord{grid_size.x - 1, 0};
-    auto core_0_endy = CoreCoord{0, grid_size.y - 1};
-    auto core_endx_endy = CoreCoord{grid_size.x - 1, grid_size.y - 1};
+    auto core_0_0 = CoreCoord{0, y0};
+    auto core_0_1 = CoreCoord{0, y0 + 1};
+    auto core_1_0 = CoreCoord{1, y0};
+    auto core_endx_0 = CoreCoord{grid_size.x - 1, y0};
+    auto core_0_endy = CoreCoord{0, y0 + grid_size.y - 1};
+    auto core_endx_endy = CoreCoord{grid_size.x - 1, y0 + grid_size.y - 1};
 
     auto in0_sender_cores = CoreRange(core_0_0, transpose_core_grid ? core_endx_0 : core_0_endy);
     auto in0_receiver_cores = CoreRange(transpose_core_grid ? core_0_1 : core_1_0, core_endx_endy);
@@ -635,11 +646,12 @@ MinimalMatmulProgramFactory::shared_variables_t minimal_matmul_factory_helper_co
 
     for (uint32_t core_id = 0; core_id < num_cores; ++core_id) {
         CoreCoord core = cores.at(core_id);
-        uint32_t in0_idx = transpose_core_grid ? core.x : core.y;
-        uint32_t in1_idx = transpose_core_grid ? core.y : core.x;
+        const uint32_t rel_y = core.y - y0;  // row inside the grid
+        uint32_t in0_idx = transpose_core_grid ? core.x : rel_y;
+        uint32_t in1_idx = transpose_core_grid ? rel_y : core.x;
 
         CoreCoord left_core = {(std::size_t)0, (std::size_t)core.y};
-        CoreCoord top_core = {(std::size_t)core.x, (std::size_t)0};
+        CoreCoord top_core = {(std::size_t)core.x, (std::size_t)y0};
 
         auto [in0_core_order, in0_core_order_index] = build_core_order_for_axis(
             core,
@@ -647,7 +659,8 @@ MinimalMatmulProgramFactory::shared_variables_t minimal_matmul_factory_helper_co
             in1_parallel_axis_cores,
             in0_noc,
             /*axis_is_x_when_not_transposed=*/true,
-            /*initial_endpoint=*/(transpose_core_grid ? top_core : left_core));
+            /*initial_endpoint=*/(transpose_core_grid ? top_core : left_core),
+            y0);
 
         auto [in1_core_order, in1_core_order_index] = build_core_order_for_axis(
             core,
@@ -655,7 +668,8 @@ MinimalMatmulProgramFactory::shared_variables_t minimal_matmul_factory_helper_co
             in0_parallel_axis_cores,
             in1_noc,
             /*axis_is_x_when_not_transposed=*/false,
-            /*initial_endpoint=*/(transpose_core_grid ? left_core : top_core));
+            /*initial_endpoint=*/(transpose_core_grid ? left_core : top_core),
+            y0);
 
         auto in0_prev_core = clamped_prev(in0_core_order, in0_core_order_index);
         auto in0_next_core = clamped_next(in0_core_order, in0_core_order_index);
@@ -680,7 +694,7 @@ MinimalMatmulProgramFactory::shared_variables_t minimal_matmul_factory_helper_co
 
         // Defer write to K block with same coordinate as core
         // The writer receiver cores always have core.x > 0
-        uint32_t defer_write_k_block = core.y * k_blocks_per_core;
+        uint32_t defer_write_k_block = rel_y * k_blocks_per_core;
         defer_write_k_block = std::min(defer_write_k_block, K_blocks - 1);
 
         bool is_in0_sink = core == in0_core_order.back();
@@ -842,10 +856,12 @@ void MinimalMatmulProgramFactory::override_runtime_arguments(
         has_fused_ternary ? 15 : 13;  // After defer_write_k_block and optional ternary addresses
     uint32_t in1_out_addr_start_idx = has_fused_ternary ? 14 : 12;
 
+    const uint32_t grid_y0 = override_variables.cores.at(0).y;  // row-major core list starts at the grid origin
     for (uint32_t i = 0; i < override_variables.num_cores; ++i) {
         CoreCoord core = override_variables.cores.at(i);
-        uint32_t in0_idx = override_variables.transpose_core_grid ? core.x : core.y;
-        uint32_t in1_idx = override_variables.transpose_core_grid ? core.y : core.x;
+        const uint32_t rel_y = core.y - grid_y0;
+        uint32_t in0_idx = override_variables.transpose_core_grid ? core.x : rel_y;
+        uint32_t in1_idx = override_variables.transpose_core_grid ? rel_y : core.x;
 
         if (in1_idx == 0) {
             auto& in0_sender_args = in0_sender_runtime_args[core.x][core.y];
