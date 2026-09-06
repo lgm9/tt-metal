@@ -27,6 +27,8 @@
 #include <iostream>
 #include <optional>
 #include <unordered_set>
+#include <mutex>
+#include <fmt/format.h>
 #include <utility>
 #include <type_traits>
 #include <variant>
@@ -1318,21 +1320,51 @@ KernelHandle CreateKernel(
 
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     CoreRangeSet core_ranges = GetCoreRangeSet(core_spec);
-    // P0.1: assert every kernel's logical y-rows are inside the active spatial partition.
-    // Fires immediately at kernel-creation time (trace-capture) so the guilty op is named.
+    // P0.1: audit every kernel's logical y-rows against the active spatial partition.
+    // Collect-and-log (09_dual_run_rebuild step 1): each distinct (kernel, rows, partition)
+    // violation is logged once as a warning so one run enumerates every op that is not
+    // partition-confined.  SPATIAL_AUDIT_FATAL=1 restores the raise-on-first behaviour.
     {
         uint32_t sp_y = tt_get_spatial_compute_grid_y();
         if (sp_y > 0) {
             uint32_t sp_y0 = tt_get_spatial_compute_grid_y_start();
+            static const bool audit_fatal = [] {
+                const char* v = std::getenv("SPATIAL_AUDIT_FATAL");
+                return v != nullptr && v[0] == '1';
+            }();
+            static std::unordered_set<std::string> reported;
+            static std::mutex reported_mutex;
             for (const auto& cr : core_ranges.ranges()) {
+                const bool inside = cr.start_coord.y >= sp_y0 && cr.end_coord.y < sp_y0 + sp_y;
+                if (inside) {
+                    continue;
+                }
                 TT_FATAL(
-                    cr.start_coord.y >= sp_y0 && cr.end_coord.y < sp_y0 + sp_y,
+                    !audit_fatal,
                     "P0.1 core audit: kernel '{}' uses logical rows [{},{}] which "
                     "falls outside active spatial partition [y_start={}, y_end={}]. "
                     "This op is not partition-confined.",
                     file_name,
                     cr.start_coord.y, cr.end_coord.y,
                     sp_y0, sp_y0 + sp_y - 1);
+                const std::string key = fmt::format(
+                    "{}|{}-{}|{}-{}", file_name, cr.start_coord.y, cr.end_coord.y, sp_y0, sp_y0 + sp_y - 1);
+                bool first;
+                {
+                    std::lock_guard<std::mutex> lock(reported_mutex);
+                    first = reported.insert(key).second;
+                }
+                if (first) {
+                    log_warning(
+                        tt::LogMetal,
+                        "P0.1 core audit: kernel '{}' uses logical rows [{},{}] which "
+                        "falls outside active spatial partition [y_start={}, y_end={}]. "
+                        "This op is not partition-confined. (logged once per kernel/rows/partition; "
+                        "SPATIAL_AUDIT_FATAL=1 to raise)",
+                        file_name,
+                        cr.start_coord.y, cr.end_coord.y,
+                        sp_y0, sp_y0 + sp_y - 1);
+                }
             }
         }
     }
