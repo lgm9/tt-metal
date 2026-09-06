@@ -127,6 +127,19 @@ public:
 
     const std::set<CoreCoord>& cores_with_runtime_args() const { return core_with_runtime_args_; }
 
+    // Spatial confinement (09_dual_run_rebuild step 1).  When CreateKernel shifted this kernel's
+    // core ranges from partition-relative rows [0, height) to [shift, shift + height), the op's
+    // factory keeps addressing cores by relative coordinates.  spatial_abs() maps those onto the
+    // absolute cores dispatch iterates; set_runtime_args also aliases the relative 2-D slot so
+    // in-place updates through runtime_args_data() reach the cores that actually run.
+    void set_spatial_row_shift(uint32_t shift, uint32_t height) {
+        spatial_row_shift_ = shift;
+        spatial_height_ = height;
+    }
+    CoreCoord spatial_abs(const CoreCoord& c) const {
+        return (spatial_row_shift_ != 0 && c.y < spatial_height_) ? CoreCoord(c.x, c.y + spatial_row_shift_) : c;
+    }
+
     const std::map<std::string, std::string>& defines() const { return defines_; }
 
     const std::set<CoreCoord>& logical_cores() const;
@@ -232,6 +245,8 @@ protected:
     std::set<CoreCoord> core_with_runtime_args_;
     std::size_t max_runtime_args_per_core_{0};  // For validation
     CoreCoord core_with_max_runtime_args_;   // For validation
+    uint32_t spatial_row_shift_ = 0;         // spatial confinement, see set_spatial_row_shift()
+    uint32_t spatial_height_ = 0;
     std::map<std::string, std::string>
         defines_;  // preprocessor defines. this is to be able to generate generic instances.
     const bool watcher_assert_enabled_;

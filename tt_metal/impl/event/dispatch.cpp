@@ -117,9 +117,13 @@ void issue_record_event_commands(
     std::vector<CQDispatchWritePackedUnicastSubCmd> unicast_sub_cmds(num_command_queues);
     std::vector<std::pair<const void*, uint32_t>> event_payloads(num_command_queues);
 
-    // Iterate [cq_id, cq_id + num_command_queues) so each CQ only writes to its own dispatch_d.
+    // num_command_queues == 1: write the event only to this CQ's own dispatch_d (the CQ-binding
+    // change; fd_mesh_command_queue passes 1).  Otherwise keep upstream semantics and write it to
+    // every CQ's dispatch_d, indexing 0..n-1.  The previous [cq_id, cq_id + n) iteration indexed
+    // dispatch_cores_[cq_id + i] unchecked and, for cq_id 1 with two queues, addressed a CQ that
+    // does not exist (09_dual_run_rebuild step 1).
     for (uint32_t i = 0; i < num_command_queues; i++) {
-        uint8_t target_cq_id = cq_id + i;
+        const uint8_t target_cq_id = (num_command_queues == 1) ? cq_id : static_cast<uint8_t>(i);
         tt_cxy_pair dispatch_location = MetalContext::instance().get_dispatch_query_manager().get_dispatch_core(target_cq_id);
         CoreCoord dispatch_virtual_core = device->virtual_core_from_logical_core(dispatch_location, dispatch_core_type);
         unicast_sub_cmds[i] = CQDispatchWritePackedUnicastSubCmd{

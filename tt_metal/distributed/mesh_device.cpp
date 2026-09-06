@@ -999,11 +999,19 @@ std::vector<std::shared_ptr<MeshDevice>> MeshDeviceImpl::get_submeshes() const {
 void MeshDeviceImpl::enable_program_cache() {
     log_info(tt::LogMetal, "Enabling program cache on MeshDevice {}", this->id());
     program_cache_->enable();
+    std::lock_guard<std::mutex> lock(partition_program_caches_mutex_);
+    for (auto& [key, cache] : partition_program_caches_) {
+        cache->enable();
+    }
 }
 
 void MeshDeviceImpl::clear_program_cache() {
     log_info(tt::LogMetal, "Clearing program cache on MeshDevice {}", this->id());
     program_cache_->clear();
+    std::lock_guard<std::mutex> lock(partition_program_caches_mutex_);
+    for (auto& [key, cache] : partition_program_caches_) {
+        cache->clear();
+    }
 }
 
 void MeshDeviceImpl::disable_and_clear_program_cache() {
@@ -1012,9 +1020,23 @@ void MeshDeviceImpl::disable_and_clear_program_cache() {
         program_cache_->disable();
     }
     program_cache_->clear();
+    std::lock_guard<std::mutex> lock(partition_program_caches_mutex_);
+    for (auto& [key, cache] : partition_program_caches_) {
+        if (cache->is_enabled()) {
+            cache->disable();
+        }
+        cache->clear();
+    }
 }
 
-size_t MeshDeviceImpl::num_program_cache_entries() { return program_cache_->num_entries(); }
+size_t MeshDeviceImpl::num_program_cache_entries() {
+    size_t n = program_cache_->num_entries();
+    std::lock_guard<std::mutex> lock(partition_program_caches_mutex_);
+    for (auto& [key, cache] : partition_program_caches_) {
+        n += cache->num_entries();
+    }
+    return n;
+}
 
 void MeshDeviceImpl::validate_sub_device_manager_tracker() const {
     if (!sub_device_manager_tracker_) {
@@ -1386,7 +1408,32 @@ bool MeshDeviceImpl::initialize_impl(
     return true;
 }
 
-program_cache::detail::ProgramCache& MeshDeviceImpl::get_program_cache() { return *program_cache_; }
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
+program_cache::detail::ProgramCache& MeshDeviceImpl::get_program_cache() {
+    const uint32_t y = tt_get_spatial_compute_grid_y();
+    if (y == 0) {
+        return *program_cache_;
+    }
+    const uint32_t key = tt_get_spatial_compute_grid_y_start() * 16u + y;
+    std::lock_guard<std::mutex> lock(partition_program_caches_mutex_);
+    auto& cache = partition_program_caches_[key];
+    if (!cache) {
+        cache = std::make_unique<program_cache::detail::ProgramCache>();
+        if (!program_cache_->is_enabled()) {
+            cache->disable();
+        }
+        cache->set_cache_misses_allowed(program_cache_->cache_misses_allowed());
+        log_info(
+            tt::LogMetal,
+            "Program cache for spatial partition y_start={} rows={} created on MeshDevice {}",
+            key / 16u,
+            y,
+            this->id());
+    }
+    return *cache;
+}
 HalProgrammableCoreType MeshDeviceImpl::get_programmable_core_type(CoreCoord virtual_core) const {
     return reference_device()->get_programmable_core_type(virtual_core);
 }

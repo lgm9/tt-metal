@@ -149,6 +149,12 @@ private:
     // Num Virtual Eth Cores == Max Number of Eth Cores across all opened devices (Issue #19729)
     std::size_t num_virtual_eth_cores_ = 0;
     std::unique_ptr<program_cache::detail::ProgramCache> program_cache_;
+    // Spatial confinement (09_dual_run_rebuild step 1): one program cache per active spatial
+    // partition, keyed on (y_start, height), so a program built for one partition's rows is never
+    // reused for another's.  get_program_cache() selects by the calling thread's partition;
+    // enable/clear/disable apply to all.  Replaces per-op program-hash edits.
+    std::unordered_map<uint32_t, std::unique_ptr<program_cache::detail::ProgramCache>> partition_program_caches_;
+    std::mutex partition_program_caches_mutex_;
     // This is a reference device used to query properties that are the same for all devices in the mesh.
     IDevice* reference_device() const;
     // Recursively quiesce all submeshes.

@@ -1303,6 +1303,65 @@ KernelHandle CreateEthernetKernel(
     return program.impl().add_kernel(kernel, eth_core_type);
 }
 
+// ── Central spatial confinement (09_dual_run_rebuild, step 1) ────────────────────────────────
+// When a spatial partition with y_start > 0 is active, a core spec expressed in partition-relative
+// rows [0, y) is shifted by y_start so the program lands inside the partition.  Specs already
+// inside [y_start, y_start + y) are left alone (factories the mechanism made partition-aware shift
+// themselves).  The two cases are only distinguishable when the intervals do not overlap, i.e.
+// y_start >= y (a bottom partition no taller than the top: 5+5, 6+4, 7+3); otherwise nothing is
+// shifted.  A CoreRangeSet is shifted only when every range is relative.  This confines every op
+// whose kernels carry no other core's coordinates in their runtime args (the data-movement and
+// eltwise stragglers the audit listed); ops with in-kernel multicast still need factory work.
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+namespace {
+inline bool spatial_shift_active(uint32_t& y0, uint32_t& y) {
+    y = tt_get_spatial_compute_grid_y();
+    if (y == 0) {
+        return false;
+    }
+    y0 = tt_get_spatial_compute_grid_y_start();
+    return y0 >= y;
+}
+inline CoreCoord spatial_confine(const CoreCoord& c) {
+    uint32_t y0 = 0, y = 0;
+    if (!spatial_shift_active(y0, y) || c.y >= y) {
+        return c;
+    }
+    return CoreCoord(c.x, c.y + y0);
+}
+inline CoreRange spatial_confine(const CoreRange& r) {
+    uint32_t y0 = 0, y = 0;
+    if (!spatial_shift_active(y0, y) || r.end_coord.y >= y) {
+        return r;
+    }
+    return CoreRange(CoreCoord(r.start_coord.x, r.start_coord.y + y0), CoreCoord(r.end_coord.x, r.end_coord.y + y0));
+}
+inline CoreRangeSet spatial_confine(const CoreRangeSet& crs) {
+    uint32_t y0 = 0, y = 0;
+    if (!spatial_shift_active(y0, y)) {
+        return crs;
+    }
+    for (const auto& r : crs.ranges()) {
+        if (r.end_coord.y >= y) {
+            return crs;
+        }
+    }
+    std::vector<CoreRange> shifted;
+    shifted.reserve(crs.ranges().size());
+    for (const auto& r : crs.ranges()) {
+        shifted.emplace_back(
+            CoreCoord(r.start_coord.x, r.start_coord.y + y0), CoreCoord(r.end_coord.x, r.end_coord.y + y0));
+    }
+    return CoreRangeSet(std::move(shifted));
+}
+inline std::variant<CoreCoord, CoreRange, CoreRangeSet> spatial_confine(
+    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& spec) {
+    return std::visit(
+        [](const auto& s) -> std::variant<CoreCoord, CoreRange, CoreRangeSet> { return spatial_confine(s); }, spec);
+}
+}  // namespace
+
 void ValidateKernelConfigDefines(const std::map<std::string, std::string>& defines) {
     for (const auto& [key, value] : defines) {
         if (value.find('\0') != std::string::npos) {
@@ -1319,7 +1378,8 @@ KernelHandle CreateKernel(
     std::visit([](const auto& cfg) { ValidateKernelConfigDefines(cfg.defines); }, config);
 
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
-    CoreRangeSet core_ranges = GetCoreRangeSet(core_spec);
+    const CoreRangeSet requested_ranges = GetCoreRangeSet(core_spec);
+    CoreRangeSet core_ranges = spatial_confine(requested_ranges);
     // P0.1: audit every kernel's logical y-rows against the active spatial partition.
     // Collect-and-log (09_dual_run_rebuild step 1): each distinct (kernel, rows, partition)
     // violation is logged once as a warning so one run enumerates every op that is not
@@ -1379,6 +1439,12 @@ KernelHandle CreateKernel(
             }
         },
         config);
+    if (!(core_ranges == requested_ranges)) {
+        // Confined: let the kernel map the factory's partition-relative core coordinates.
+        uint32_t y0 = 0, y = 0;
+        spatial_shift_active(y0, y);
+        program.impl().get_kernel(kernel)->set_spatial_row_shift(y0, y);
+    }
 
     const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig> cfg_variant = std::visit(
         [&](const auto& cfg) -> std::variant<DataMovementConfig, ComputeConfig, EthernetConfig> { return cfg; },
@@ -1405,9 +1471,10 @@ KernelHandle CreateKernelFromString(
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
     const std::variant<DataMovementConfig, ComputeConfig>& config) {
     std::visit([](const auto& cfg) { ValidateKernelConfigDefines(cfg.defines); }, config);
-    CoreRangeSet core_ranges = GetCoreRangeSet(core_spec);
+    const CoreRangeSet requested_ranges = GetCoreRangeSet(core_spec);
+    CoreRangeSet core_ranges = spatial_confine(requested_ranges);
     KernelSource kernel_src(kernel_src_code, KernelSource::SOURCE_CODE);
-    return std::visit(
+    KernelHandle kernel = std::visit(
         [&](const auto& cfg) -> KernelHandle {
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, DataMovementConfig>) {
@@ -1417,6 +1484,12 @@ KernelHandle CreateKernelFromString(
             }
         },
         config);
+    if (!(core_ranges == requested_ranges)) {
+        uint32_t y0 = 0, y = 0;
+        spatial_shift_active(y0, y);
+        program.impl().get_kernel(kernel)->set_spatial_row_shift(y0, y);
+    }
+    return kernel;
 }
 
 KernelHandle CreateKernelFromString(
@@ -1435,7 +1508,7 @@ CBHandle CreateCircularBuffer(
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
     const CircularBufferConfig& config) {
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
-    CoreRangeSet core_ranges = GetCoreRangeSet(core_spec);
+    CoreRangeSet core_ranges = spatial_confine(GetCoreRangeSet(core_spec));
     auto cb_handle = program.impl().add_circular_buffer(core_ranges, config);
     LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureCreateCircularBuffer, cb_handle, program, core_spec, config);
     return cb_handle;
@@ -1490,6 +1563,9 @@ uint32_t CreateSemaphore(
             },
         },
         core_spec);
+    if (core_type == CoreType::WORKER) {
+        crs = spatial_confine(crs);   // same rule as kernels and circular buffers
+    }
     std::optional<uint32_t> semaphore_id;
     TT_FATAL(!crs.ranges().empty(), "Expecting a non-empty CoreRangeSet!");
     TT_FATAL(
@@ -1714,7 +1790,7 @@ CBHandle CreateCircularBuffer(
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
     const CircularBufferConfig& config,
     const GlobalCircularBuffer& global_circular_buffer) {
-    CoreRangeSet core_ranges = GetCoreRangeSet(core_spec);
+    CoreRangeSet core_ranges = spatial_confine(GetCoreRangeSet(core_spec));
     return program.impl().add_circular_buffer(core_ranges, config, global_circular_buffer);
 }
 
