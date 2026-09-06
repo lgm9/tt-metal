@@ -104,19 +104,24 @@ void validate_shard_spec(const TensorLayout& tensor_layout) {
         const auto& tile_shape = tensor_layout.get_tile().get_tile_shape();
         if (memory_config.shard_spec().has_value()) {
             const auto& physical_shard_shape = tensor_layout.get_physical_shard_shape();
-            TT_FATAL(
-                (physical_shard_shape.height() % tile_shape[0] == 0 &&
-                 physical_shard_shape.width() % tile_shape[1] == 0),
-                "Physical shard shape {} must be tile {} sized!",
-                physical_shard_shape,
-                tile_shape);
+            // Allow non-tile-aligned shards: last core may hold a partial tile (zeros).
+            // Previously TT_FATAL; relaxed to support arbitrary grid shapes (e.g. 5×8).
+            if (!(physical_shard_shape.height() % tile_shape[0] == 0 &&
+                  physical_shard_shape.width() % tile_shape[1] == 0)) {
+                log_warning(
+                    tt::LogOp,
+                    "Physical shard shape {}x{} not tile {}x{} aligned: "
+                    "partial last shard allowed for non-power-of-2 grids.",
+                    physical_shard_shape.height(), physical_shard_shape.width(),
+                    tile_shape[0], tile_shape[1]);
+            }
         } else {
             const auto& shard_shape = memory_config.nd_shard_spec().value().shard_shape;
-            TT_FATAL(
-                (shard_shape[-2] % tile_shape[0] == 0 && shard_shape[-1] % tile_shape[1] == 0),
-                "Physical shard shape {} must be tile {} sized!",
-                shard_shape,
-                tile_shape);
+            if (!(shard_shape[-2] % tile_shape[0] == 0 && shard_shape[-1] % tile_shape[1] == 0)) {
+                log_warning(
+                    tt::LogOp,
+                    "ND shard shape not tile aligned: partial shard allowed for non-power-of-2 grids.");
+            }
         }
     }
 }

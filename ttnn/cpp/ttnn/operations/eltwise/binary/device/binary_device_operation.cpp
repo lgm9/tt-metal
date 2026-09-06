@@ -16,6 +16,10 @@
 
 using namespace tt::tt_metal;
 
+// Spatial-partition thread-locals (set by Python's set_spatial_partition())
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::operations::binary {
 
 namespace utils {
@@ -394,6 +398,18 @@ bool BinaryDeviceOperation::skip_launch(
 
 }  // namespace ttnn::operations::binary
 
+// Return the CoreRangeSet for this thread's spatial partition.
+// When no partition is active (tt_get_spatial_compute_grid_y() == 0) returns
+// an empty set; the caller falls through to the all-sub-device merge path.
+static CoreRangeSet binary_partition_workers(IDevice* device) {
+    const uint32_t y = tt_get_spatial_compute_grid_y();
+    if (y == 0) return {};
+    const uint32_t x0 = static_cast<uint32_t>(device->compute_with_storage_grid_size().x);
+    const uint32_t x  = x0 < 8u ? x0 : 8u;
+    const uint32_t y0 = tt_get_spatial_compute_grid_y_start();
+    return CoreRangeSet{CoreRange{CoreCoord{0, y0}, CoreCoord{x - 1, y0 + y - 1}}};
+}
+
 namespace ttnn::prim {
 
 ttnn::operations::binary::BinaryDeviceOperation::tensor_return_value_t binary(
@@ -456,9 +472,16 @@ ttnn::operations::binary::BinaryDeviceOperation::tensor_return_value_t binary(
         }
     } else {
         auto* device = input_tensor_a_arg.device();
-        for (const auto& sub_device_id : device->get_sub_device_ids()) {
-            const auto& sub_device_workers = device->worker_cores(HalProgrammableCoreType::TENSIX, sub_device_id);
-            worker_grid = worker_grid.merge(sub_device_workers);
+        // Spatial partition: restrict to this thread's rows so two instances on
+        // the same chip don't share the same program-cache entry.
+        CoreRangeSet sp = binary_partition_workers(device);
+        if (!sp.ranges().empty()) {
+            worker_grid = sp;
+        } else {
+            for (const auto& sub_device_id : device->get_sub_device_ids()) {
+                const auto& sub_device_workers = device->worker_cores(HalProgrammableCoreType::TENSIX, sub_device_id);
+                worker_grid = worker_grid.merge(sub_device_workers);
+            }
         }
     }
 

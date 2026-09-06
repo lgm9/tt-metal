@@ -504,10 +504,10 @@ class RotarySetup(LightweightModule):
                         row_wise=True,
                     )
                 else:
-                    # Use batch_size (which is doubled_batch_size for fused QK) to determine the number of cores
-                    if batch_size % 32 == 0:
-                        return ttnn.CoreGrid(y=8, x=8)
-                    return ttnn.num_cores_to_corerangeset(batch_size, core_grid, row_wise=True)
+                    # One core per batch element, 8 cols wide; cap at 8 rows (64 cores max).
+                    # Avoids allocating 64 cores for batch=32 (upstream % 32 check is too coarse).
+                    _bh_rows = min(math.ceil(batch_size / 8), 8)
+                    return ttnn.CoreGrid(y=_bh_rows, x=8)
             else:
                 return ttnn.num_cores_to_corerangeset(batch_size, core_grid, row_wise=True)
 
@@ -518,7 +518,6 @@ class RotarySetup(LightweightModule):
             self.batch_size_per_device_group,
             self.prefetcher,
         )
-
         # Generate the transformation matrix
         trans_mat = get_rot_transformation_mat(dhead=ttnn.TILE_SIZE).repeat(
             1,

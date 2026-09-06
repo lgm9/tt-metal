@@ -23,6 +23,7 @@ struct LayerNormMultiCoreSharedVariables {
     tt::tt_metal::KernelHandle writer_kernel_id{};
     uint32_t num_cores = 0;
     CoreCoord grid_size;
+    uint32_t core_y_start = 0;  // y offset for active spatial partition (0 when none)
 };
 
 struct LayerNormMultiCoreProgramFactory {

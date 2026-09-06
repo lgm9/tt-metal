@@ -47,7 +47,7 @@ def _deepseek_kvdbg_enabled() -> bool:
 
 
 class Generator(WarmupForwardMixin):
-    def __init__(self, model, model_args, mesh_device, processor=None, tokenizer=None):
+    def __init__(self, model, model_args, mesh_device, processor=None, tokenizer=None, formatter=None, cq_id=0):
         """
         Creating a LlamaVision wrapper requires only a mesh_device and model_args.
         With model_args you have the checkpoint location, can specify max batch size
@@ -64,6 +64,7 @@ class Generator(WarmupForwardMixin):
         self.processor = processor
         self.tokenizer = tokenizer
         self.data_parallel = len(self.model)
+        self.cq_id = cq_id
         self.prev_page_table = None
         self.trace_id_prefill = defaultdict(lambda: None)
         self.trace_inputs_prefill = defaultdict(lambda: None)
@@ -1018,7 +1019,9 @@ class Generator(WarmupForwardMixin):
             tt_decode_output = self._decode_forward_no_trace_text(**decode_kwargs)
 
         if read_from_device:
+            ttnn._ttnn.core.push_current_command_queue_id_for_thread(ttnn.QueueId(self.cq_id))
             to_host = self.read_decode_output(tt_decode_output)
+            ttnn._ttnn.core.pop_current_command_queue_id_for_thread()
             return self.process_decode_output_host(to_host, is_tokens=(sampling_params is not None))
         return tt_decode_output
 
@@ -1079,7 +1082,12 @@ class Generator(WarmupForwardMixin):
         Captures a trace for the decode_forward method.
         """
 
-        # Compile run
+        ttnn._ttnn.core.push_current_command_queue_id_for_thread(ttnn.QueueId(self.cq_id))
+
+        # Compile run — enable per-layer sync to find hanging layer
+        for m in self.model:
+            m._debug_layer_sync = True
+            m._debug_cq_id = self.cq_id
         self._decode_forward_no_trace_text(
             tokens,
             current_pos,
@@ -1087,7 +1095,14 @@ class Generator(WarmupForwardMixin):
             kv_cache=kv_cache,
             sampling_on_device=sampling_on_device,
         )
+        for m in self.model:
+            m._debug_layer_sync = False
         logger.info("Done Compiling Model")
+        import sys
+        # Sync device before starting trace capture to ensure compile run is finished
+        print(f"[TRACE_DBG] Syncing device before trace capture cq_id={self.cq_id}", file=sys.stderr, flush=True)
+        ttnn.synchronize_device(self.model_args[0].mesh_device, cq_id=self.cq_id)
+        print(f"[TRACE_DBG] Sync done, starting trace capture", file=sys.stderr, flush=True)
 
         # Get inputs ready for trace run
         device_inputs = []
@@ -1110,7 +1125,7 @@ class Generator(WarmupForwardMixin):
                 and sampling_module is not None
                 and getattr(sampling_module, "enable_internal_trace", False)
             )
-            trace_id = ttnn.begin_trace_capture(self.model_args[i].mesh_device, cq_id=0)
+            trace_id = ttnn.begin_trace_capture(self.model_args[i].mesh_device, cq_id=self.cq_id)
             trace_ids[i] = trace_id
             user_kv_cache = kv_cache[i] if kv_cache is not None else None
             tt_out_trace.append(
@@ -1121,10 +1136,14 @@ class Generator(WarmupForwardMixin):
                     capture_sampling_trace=split_enabled,
                 )
             )
-            ttnn.end_trace_capture(self.model_args[i].mesh_device, trace_id, cq_id=0)
+            print(f"[TRACE_DBG] end_trace_capture i={i} trace_id={trace_id}", file=sys.stderr, flush=True)
+            ttnn.end_trace_capture(self.model_args[i].mesh_device, trace_id, cq_id=self.cq_id)
+            print(f"[TRACE_DBG] end_trace_capture done", file=sys.stderr, flush=True)
 
             if split_enabled:
                 sampling_module.capture_trace(logits=tt_out_trace[i], tt_out_tok=device_inputs[i][0])
+
+        ttnn._ttnn.core.pop_current_command_queue_id_for_thread()
         logger.info("Done Capturing Decode Trace")
 
         return trace_ids, tt_out_trace, *device_inputs
@@ -1154,6 +1173,7 @@ class Generator(WarmupForwardMixin):
             if page_table is not None:
                 self.prev_page_table = tuple(pt.clone() for pt in page_table)
 
+        ttnn._ttnn.core.push_current_command_queue_id_for_thread(ttnn.QueueId(self.cq_id))
         if reset_inputs:
             for i in range(self.data_parallel):
                 user_page_table = page_table[i] if page_table is not None else None
@@ -1163,8 +1183,12 @@ class Generator(WarmupForwardMixin):
                     host_tensors=host_inputs_i,
                     device_tensors=self.trace_inputs_decode[sampling_on_device][i],
                 )
+        import sys
         for i, trace_id in self.trace_ids_decode[sampling_on_device].items():
-            ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=0, blocking=False)
+            print(f"[TRACE_DBG] execute_trace i={i} trace_id={trace_id} blocking=False", file=sys.stderr, flush=True)
+            ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=self.cq_id, blocking=False)
+            print(f"[TRACE_DBG] execute_trace dispatched", file=sys.stderr, flush=True)
+        ttnn._ttnn.core.pop_current_command_queue_id_for_thread()
         outputs = self.trace_output_decode[sampling_on_device]
         if sampling_on_device:
             new_outputs = []
@@ -1506,12 +1530,17 @@ class Generator(WarmupForwardMixin):
         if not async_read:
             # output is a tuple of (tt_out_tok, tt_log_probs)
             if isinstance(tt_out[0], tuple):
-                return [
-                    (out[0].cpu(), out[1].cpu() if out[1] is not None else None)  # logits should never be None
-                    for out in tt_out
-                ]
+                import sys
+                print(f"[TRACE_DBG] .cpu() start (tuple case)", file=sys.stderr, flush=True)
+                result = [(out[0].cpu(), out[1].cpu() if out[1] is not None else None) for out in tt_out]
+                print(f"[TRACE_DBG] .cpu() done", file=sys.stderr, flush=True)
+                return result
             elif isinstance(tt_out[0], ttnn.Tensor):
-                return [out.cpu() for out in tt_out]
+                import sys
+                print(f"[TRACE_DBG] .cpu() start (tensor case)", file=sys.stderr, flush=True)
+                result = [out.cpu() for out in tt_out]
+                print(f"[TRACE_DBG] .cpu() done (tensor case)", file=sys.stderr, flush=True)
+                return result
 
         host_outputs = []
         read_events = []

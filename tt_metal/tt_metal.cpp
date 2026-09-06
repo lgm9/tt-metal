@@ -64,6 +64,10 @@
 #include <experimental/fabric/control_plane.hpp>
 #include "impl/buffers/circular_buffer.hpp"
 
+// P0.1: per-op core audit — declared at file scope for use inside CreateKernel.
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace tt::tt_metal {
 struct RuntimeArgsData;
 struct TraceDescriptor;
@@ -1314,6 +1318,24 @@ KernelHandle CreateKernel(
 
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     CoreRangeSet core_ranges = GetCoreRangeSet(core_spec);
+    // P0.1: assert every kernel's logical y-rows are inside the active spatial partition.
+    // Fires immediately at kernel-creation time (trace-capture) so the guilty op is named.
+    {
+        uint32_t sp_y = tt_get_spatial_compute_grid_y();
+        if (sp_y > 0) {
+            uint32_t sp_y0 = tt_get_spatial_compute_grid_y_start();
+            for (const auto& cr : core_ranges.ranges()) {
+                TT_FATAL(
+                    cr.start_coord.y >= sp_y0 && cr.end_coord.y < sp_y0 + sp_y,
+                    "P0.1 core audit: kernel '{}' uses logical rows [{},{}] which "
+                    "falls outside active spatial partition [y_start={}, y_end={}]. "
+                    "This op is not partition-confined.",
+                    file_name,
+                    cr.start_coord.y, cr.end_coord.y,
+                    sp_y0, sp_y0 + sp_y - 1);
+            }
+        }
+    }
     KernelSource kernel_src(file_name, KernelSource::FILE_PATH);
     KernelHandle kernel = std::visit(
         [&](const auto& cfg) -> KernelHandle {

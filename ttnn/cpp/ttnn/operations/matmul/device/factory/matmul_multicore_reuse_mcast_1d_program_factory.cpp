@@ -24,6 +24,9 @@ using namespace tt;
 using ttnn::operations::unary::UnaryOpType;
 using ttnn::operations::unary::UnaryWithParam;
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 namespace reuse_mcast_1d_optimized_helpers {
@@ -275,6 +278,18 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
 
     CoreCoord top_left_core = in0_mcast_receiver_cores_bounding_box.start_coord;
     CoreCoord bottom_right_core = in0_mcast_receiver_cores_bounding_box.end_coord;
+    // P0.4: assert in0 mcast bounding box stays within the active spatial partition.
+    {
+        uint32_t sp_y = tt_get_spatial_compute_grid_y();
+        if (sp_y > 0) {
+            uint32_t sp_y0 = tt_get_spatial_compute_grid_y_start();
+            TT_FATAL(
+                top_left_core.y >= sp_y0 && bottom_right_core.y < sp_y0 + sp_y,
+                "P0.4 mcast_1d in0: bounding box rows [{},{}] crosses spatial partition "
+                "[y_start={}, y_end={}]. Mcast will corrupt adjacent partition L1.",
+                top_left_core.y, bottom_right_core.y, sp_y0, sp_y0 + sp_y - 1);
+        }
+    }
     auto top_left_core_physical = device->worker_core_from_logical_core(top_left_core);
     auto bottom_right_core_physical = device->worker_core_from_logical_core(bottom_right_core);
 
@@ -1198,9 +1213,18 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in1_
     uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
     uint32_t num_cores = num_blocks_total;
 
+    // num_cores_to_corerangeset validates start_core.y < grid_size.y.
+    // compute_with_storage_grid_size.y is the partition HEIGHT (e.g. 1 for GRID_Y_T=1),
+    // but start_core.y is an ABSOLUTE row index (e.g. 5 when y_start=5).
+    // Adjust the grid's y dimension to be the absolute upper bound so the check passes.
+    CoreCoord effective_grid_for_placement = {
+        compute_with_storage_grid_size.x,
+        compute_with_storage_grid_size.y + start_core.y
+    };
+
     constexpr bool row_major = true;
     CoreRangeSet all_cores =
-        tt::tt_metal::num_cores_to_corerangeset(start_core, num_cores, compute_with_storage_grid_size, row_major);
+        tt::tt_metal::num_cores_to_corerangeset(start_core, num_cores, effective_grid_for_placement, row_major);
     CoreRange in1_mcast_receiver_cores_bounding_box = all_cores.bounding_box();
     uint32_t in1_mcast_receiver_num_cores = in1_mcast_receiver_cores_bounding_box.size();  // always mcast to full grid
 
@@ -1211,7 +1235,7 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in1_
                                        ? CoreCoord{start_core.x + 1, start_core.y}
                                        : CoreCoord{start_core.x, start_core.y + 1};
         in1_mcast_receivers = tt::tt_metal::num_cores_to_corerangeset(
-            receiver_start_core, num_cores - 1, compute_with_storage_grid_size, row_major);
+            receiver_start_core, num_cores - 1, effective_grid_for_placement, row_major);
     }
 
     // Mcast args
@@ -1220,6 +1244,18 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in1_
 
     CoreCoord top_left_core = in1_mcast_receiver_cores_bounding_box.start_coord;
     CoreCoord bottom_right_core = in1_mcast_receiver_cores_bounding_box.end_coord;
+    // P0.4: assert in1 mcast bounding box stays within the active spatial partition.
+    {
+        uint32_t sp_y = tt_get_spatial_compute_grid_y();
+        if (sp_y > 0) {
+            uint32_t sp_y0 = tt_get_spatial_compute_grid_y_start();
+            TT_FATAL(
+                top_left_core.y >= sp_y0 && bottom_right_core.y < sp_y0 + sp_y,
+                "P0.4 mcast_1d in1: bounding box rows [{},{}] crosses spatial partition "
+                "[y_start={}, y_end={}]. Mcast will corrupt adjacent partition L1.",
+                top_left_core.y, bottom_right_core.y, sp_y0, sp_y0 + sp_y - 1);
+        }
+    }
     auto top_left_core_physical = device->worker_core_from_logical_core(top_left_core);
     auto bottom_right_core_physical = device->worker_core_from_logical_core(bottom_right_core);
 
@@ -3046,6 +3082,11 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t matmul_multi_core_
             device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sub_device_id.value());
         auto bbox = sub_device_cores.bounding_box();
         sub_device_start_core = bbox.start_coord;
+    } else {
+        uint32_t y_start = tt_get_spatial_compute_grid_y_start();
+        if (y_start > 0) {
+            sub_device_start_core = {0, y_start};
+        }
     }
 
     if (mcast_in0) {

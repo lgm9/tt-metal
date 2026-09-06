@@ -34,9 +34,11 @@ struct BinaryDeviceOperation {
         std::optional<DeviceComputeKernelConfig> compute_kernel_config;
 
         ttsl::hash::hash_t to_hash() const {
-            // hash has to exclude the scalar value
+            // hash has to exclude the scalar value; include worker_grid so
+            // different spatial partitions get separate program cache entries.
             return ttsl::hash::hash_objects_with_default_seed(
-                binary_op_type, activations, input_tensor_a_activation, memory_config, dtype, compute_kernel_config);
+                binary_op_type, activations, input_tensor_a_activation, memory_config, dtype, compute_kernel_config,
+                worker_grid);
         }
     };
     struct tensor_args_t {

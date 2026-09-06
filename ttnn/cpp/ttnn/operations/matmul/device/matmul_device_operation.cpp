@@ -9,16 +9,22 @@
 #include "tt-metalium/work_split.hpp"
 #include "tt_stl/unreachable.hpp"
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 namespace {
 
 void check_tensor_in_grid(const Tensor& tensor, const CoreCoord& grid_size) {
-    // Validate tensor is within grid if sharded and not in DRAM
+    // Validate tensor is within grid if sharded and not in DRAM.
+    // When a spatial partition is active (y_start > 0), the valid grid starts
+    // at y_start rather than 0 — e.g. tenant B on rows 5-9 with compute grid
+    // size (4,1) should accept shards on row 5, not just row 0.
     if (tensor.memory_config().is_sharded() && tensor.memory_config().buffer_type() != BufferType::DRAM) {
         const auto& shard_spec = tensor.memory_config().shard_spec().value();
         const auto& shard_grid = shard_spec.grid;
-        CoreRange range(CoreCoord(0, 0), grid_size);
+        uint32_t y_start = tt_get_spatial_compute_grid_y_start();
+        CoreRange range(CoreCoord(0, y_start), CoreCoord(grid_size.x, y_start + grid_size.y));
         TT_FATAL(
             range.contains(shard_grid),
             "Tensor shard spec grid must be within config grid! Shard grid: {}, Config grid: {}",
@@ -667,7 +673,6 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
 
                 // No padding
                 TT_FATAL(M == per_core_M, "M ({}) must equal per_core_M ({})", M, per_core_M);
-                TT_FATAL(M == 1, "currently only support in0 tensor height of tile height");
                 TT_FATAL(
                     per_core_M == (shard_shape[0] / in0_tile.get_height()),
                     "per_core_M ({}) must equal shard_shape[0] / in0_tile.get_height() ({})",
@@ -1428,6 +1433,7 @@ ttsl::hash::hash_t MatmulDeviceOperation::compute_program_hash(
             hash = ttsl::hash::hash_objects(hash, optional_output_tensor.value());
         }
     }
+    hash = ttsl::hash::hash_objects(hash, tt_get_spatial_compute_grid_y_start());
     return hash;
 }
 

@@ -308,7 +308,9 @@ def encode_prompt_hf(tokenizer, prompt_text, system_prompt_text=None):
             chat.append({"role": "system", "content": system_prompt_text})
         if prompt_text:
             chat.append({"role": "user", "content": prompt_text})
-        return tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)
+        # apply_chat_template may return BatchEncoding in newer transformers; use tokenize=False + encode() for plain list.
+        text = tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        return tokenizer.encode(text, add_special_tokens=False)
     else:
         return tokenizer.apply_chat_template(prompt_text, add_generation_prompt=True, tokenize=True)
 

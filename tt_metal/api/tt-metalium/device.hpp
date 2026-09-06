@@ -102,6 +102,18 @@ public:
     // requests
     virtual std::vector<CoreCoord> get_optimal_dram_bank_to_logical_worker_assignment(NOC noc) = 0;
 
+    // When a spatial partition is active, update the DRAM bank-to-NOC table in each partition core's L1 to use
+    // the DRAM endpoint (NOC0 or NOC1 subchannel) that is closest to / inside the partition.  This eliminates
+    // cross-partition NOC traversal that would otherwise cause VC-starvation deadlock under concurrent dual-CQ load.
+    // bank_start / bank_count: restrict the bank table to a contiguous subset of physical DRAM banks, cycling
+    // slots beyond bank_count back to bank_start.  bank_count == 0 means "use all banks" (default behaviour).
+    virtual void update_dram_bank_table_for_partition(
+        uint32_t y_start, uint32_t num_rows, uint32_t bank_start, uint32_t bank_count) = 0;
+    // Convenience overload: full bank range (backward-compatible call sites unchanged).
+    void update_dram_bank_table_for_partition(uint32_t y_start, uint32_t num_rows) {
+        update_dram_bank_table_for_partition(y_start, num_rows, 0, 0);
+    }
+
     // Convert a logical coordinate to virtual coordinate
     virtual CoreCoord virtual_core_from_logical_core(
         const CoreCoord& logical_coord, const CoreType& core_type) const = 0;

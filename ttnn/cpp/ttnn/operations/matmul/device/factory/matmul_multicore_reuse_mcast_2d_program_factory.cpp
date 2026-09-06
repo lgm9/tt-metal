@@ -22,6 +22,8 @@
 using ttnn::operations::unary::UnaryOpType;
 using ttnn::operations::unary::UnaryWithParam;
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 namespace reuse_mcast_optimized_helpers {
@@ -1714,6 +1716,11 @@ static MatmulMultiCoreReuseMcast2DProgramFactory::cached_program_t matmul_multi_
             tt::tt_metal::HalProgrammableCoreType::TENSIX, operation_attributes.sub_device_id.value());
         auto bbox = sub_device_cores.bounding_box();
         sub_device_start_core = bbox.start_coord;
+    } else {
+        uint32_t y_start = tt_get_spatial_compute_grid_y_start();
+        if (y_start > 0) {
+            sub_device_start_core = {0, y_start};
+        }
     }
 
     ////////////////////////////////////////////////////////////////////////////

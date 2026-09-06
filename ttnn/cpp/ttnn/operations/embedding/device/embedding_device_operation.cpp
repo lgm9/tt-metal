@@ -12,6 +12,8 @@ using namespace tt::tt_metal;
 
 #define RISC_CORES_PER_TENSIX 2
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 EmbeddingsDeviceOperation::program_factory_t EmbeddingsDeviceOperation::select_program_factory(
@@ -133,6 +135,15 @@ Tensor EmbeddingsDeviceOperation::create_output_tensors(
     }
     return create_device_tensor(
         compute_output_specs(operation_attributes, tensor_args), tensor_args.input_tensor_arg.device());
+}
+
+tt::tt_metal::operation::Hash EmbeddingsDeviceOperation::compute_program_hash(
+    const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
+    return tt::tt_metal::operation::hash_operation<EmbeddingsDeviceOperation>(
+        attributes,
+        tensor_args.input_tensor_arg,
+        tensor_args.weight_arg,
+        tt_get_spatial_compute_grid_y_start());
 }
 
 Tensor embedding(

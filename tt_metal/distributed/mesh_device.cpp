@@ -63,6 +63,39 @@
 #include "dummy_mesh_command_queue.hpp"
 #include "impl/context/metal_env_accessor.hpp"
 
+// Thread-local spatial-partition compute grid override.
+// When valid, MeshDevice::compute_with_storage_grid_size() returns this value
+// instead of the hardware default.  Set by tt_set_spatial_compute_grid() which
+// is called from Python's set_spatial_partition() via ctypes.
+namespace {
+struct SpatialGridOverride {
+    uint32_t x = 0, y = 0, y_start = 0;
+    bool valid = false;
+};
+thread_local SpatialGridOverride tl_spatial_grid;
+}  // namespace
+
+extern "C" {
+void tt_set_spatial_compute_grid(uint32_t x, uint32_t y) {
+    tl_spatial_grid = {x, y, 0, true};
+}
+// Extended version that also carries the row offset (y_start) for DRAM assignment.
+void tt_set_spatial_compute_grid_v2(uint32_t x, uint32_t y, uint32_t y_start) {
+    tl_spatial_grid = {x, y, y_start, true};
+}
+void tt_clear_spatial_compute_grid() {
+    tl_spatial_grid.valid = false;
+}
+// Returns the overridden compute grid height (y) if active, else 0.
+uint32_t tt_get_spatial_compute_grid_y() {
+    return tl_spatial_grid.valid ? tl_spatial_grid.y : 0;
+}
+// Returns the starting row for DRAM reader assignment when override is active, else 0.
+uint32_t tt_get_spatial_compute_grid_y_start() {
+    return tl_spatial_grid.valid ? tl_spatial_grid.y_start : 0;
+}
+}  // extern "C"
+
 namespace tt::tt_metal {
 class SystemMemoryManager;
 
@@ -1050,6 +1083,12 @@ std::vector<CoreCoord> MeshDeviceImpl::worker_cores_from_logical_cores(
 std::vector<CoreCoord> MeshDeviceImpl::get_optimal_dram_bank_to_logical_worker_assignment(NOC noc) {
     return get_devices().front()->get_optimal_dram_bank_to_logical_worker_assignment(noc);
 }
+void MeshDeviceImpl::update_dram_bank_table_for_partition(
+    uint32_t y_start, uint32_t num_rows, uint32_t bank_start, uint32_t bank_count) {
+    for (auto* device : get_devices()) {
+        device->update_dram_bank_table_for_partition(y_start, num_rows, bank_start, bank_count);
+    }
+}
 CoreCoord MeshDeviceImpl::virtual_core_from_logical_core(
     const CoreCoord& logical_coord, const CoreType& core_type) const {
     return validate_and_get_reference_value(this->get_devices(), [logical_coord, core_type](const auto* device) {
@@ -1511,6 +1550,10 @@ std::vector<CoreCoord> MeshDevice::ethernet_cores_from_logical_cores(
 std::vector<CoreCoord> MeshDevice::get_optimal_dram_bank_to_logical_worker_assignment(NOC noc) {
     return pimpl_->get_optimal_dram_bank_to_logical_worker_assignment(noc);
 }
+void MeshDevice::update_dram_bank_table_for_partition(
+    uint32_t y_start, uint32_t num_rows, uint32_t bank_start, uint32_t bank_count) {
+    pimpl_->update_dram_bank_table_for_partition(y_start, num_rows, bank_start, bank_count);
+}
 CoreCoord MeshDevice::virtual_core_from_logical_core(const CoreCoord& logical_coord, const CoreType& core_type) const {
     return pimpl_->virtual_core_from_logical_core(logical_coord, core_type);
 }
@@ -1544,7 +1587,12 @@ bool MeshDevice::is_inactive_ethernet_core(CoreCoord logical_core) const {
 uint32_t MeshDevice::num_virtual_eth_cores(SubDeviceId sub_device_id) {
     return pimpl_->num_virtual_eth_cores(sub_device_id);
 }
-CoreCoord MeshDevice::compute_with_storage_grid_size() const { return pimpl_->compute_with_storage_grid_size(); }
+CoreCoord MeshDevice::compute_with_storage_grid_size() const {
+    if (tl_spatial_grid.valid) {
+        return CoreCoord{tl_spatial_grid.x, tl_spatial_grid.y};
+    }
+    return pimpl_->compute_with_storage_grid_size();
+}
 CoreRangeSet MeshDevice::worker_cores(HalProgrammableCoreType core_type, SubDeviceId sub_device_id) const {
     return pimpl_->worker_cores(core_type, sub_device_id);
 }

@@ -27,6 +27,8 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
+#include <thread>
 #include <vector>
 
 #include "allocator.hpp"
@@ -754,19 +756,36 @@ void Device::reset_sub_device_stall_group() {
     TT_FATAL(false, "reset_sub_device_stall_group is deprecated for device");
 }
 
+// Declared in mesh_device.cpp — thread-local spatial partition helpers (0 = no override).
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 std::vector<CoreCoord> Device::get_optimal_dram_bank_to_logical_worker_assignment(NOC noc) {
     // Top level function that users (ex: Op Writers) can use to assign Tensix Worker cores
     // as DRAM readers or writers. Returns logical coordinates of optimally placed workers.
     // This function queries Physical Coordinates (only exposed directly to the Device class)
     // and passes them to logic in core_assignment.cpp to derive the most optimal core placement
     // based on architecture specific logic and Physical Grid configuration.
-    if (this->optimal_dram_bank_to_logical_worker_assignment_.empty()) {
+    //
+    // When a spatial partition is active (sub-device split), use the overridden row count and
+    // skip the cache so that each partition gets its own assignment.
+    uint32_t spatial_y = tt_get_spatial_compute_grid_y();
+    bool has_spatial_override = (spatial_y > 0);
+    uint32_t y_start = has_spatial_override ? tt_get_spatial_compute_grid_y_start() : 0;
+    if (!has_spatial_override && !this->optimal_dram_bank_to_logical_worker_assignment_.empty()) {
+        return this->optimal_dram_bank_to_logical_worker_assignment_;
+    }
+    // Use a local vector when spatial override is active (not cached); use member otherwise.
+    std::vector<CoreCoord> local_result;
+    std::vector<CoreCoord>& dest = has_spatial_override ? local_result
+                                                        : this->optimal_dram_bank_to_logical_worker_assignment_;
+    {
         uint32_t full_grid_size_x = this->grid_size().x;
         uint32_t full_grid_size_y = this->grid_size().y;
 
         auto compute_with_storage_grid_size = this->compute_with_storage_grid_size();
         uint32_t num_cores_x = compute_with_storage_grid_size.x;
-        uint32_t num_cores_y = compute_with_storage_grid_size.y;
+        uint32_t num_cores_y = has_spatial_override ? spatial_y : compute_with_storage_grid_size.y;
         // Get physical coordinates of DRAM Controller NOC end-points
         uint32_t num_dram_banks = this->num_dram_channels();
 
@@ -780,15 +799,16 @@ std::vector<CoreCoord> Device::get_optimal_dram_bank_to_logical_worker_assignmen
         bool dram_is_virtualized =
             noc_translation_enabled && (hal.get_virtualized_core_types().contains(dev_msgs::AddressableCoreType::DRAM));
         const metal_SocDescriptor& soc_d = MetalEnvAccessor(*env_).impl().get_cluster().get_soc_desc(this->id());
+        auto translate_dram_core = [&](CoreCoord c) -> CoreCoord {
+            if (!dram_is_virtualized) return c;
+            tt::umd::CoreCoord u = soc_d.translate_coord_to(
+                tt_xy_pair(c.x, c.y), CoordSystem::TRANSLATED, CoordSystem::NOC0);
+            return CoreCoord(u.x, u.y);
+        };
+
         std::vector<CoreCoord> dram_phy_coords;
         for (int i = 0; i < num_dram_banks; ++i) {
-            auto dram_core = this->dram_core_from_dram_channel(i, noc);
-            if (dram_is_virtualized) {
-                tt::umd::CoreCoord umd_dram_coord = soc_d.translate_coord_to(
-                    tt_xy_pair(dram_core.x, dram_core.y), CoordSystem::TRANSLATED, CoordSystem::NOC0);
-                dram_core = CoreCoord(umd_dram_coord.x, umd_dram_coord.y);
-            }
-            dram_phy_coords.push_back(dram_core);
+            dram_phy_coords.push_back(translate_dram_core(this->dram_core_from_dram_channel(i, noc)));
         }
         // Get all logical cores in the worker grid
         std::vector<CoreCoord> all_worker_cores_logical;
@@ -797,36 +817,207 @@ std::vector<CoreCoord> Device::get_optimal_dram_bank_to_logical_worker_assignmen
                 all_worker_cores_logical.push_back(CoreCoord(i, j));
             }
         }
-        // Get the physical rows and cols  (y, x) in the worker grid
+        // Get the physical rows and cols  (y, x) in the worker grid.
+        // When a spatial partition is active, start from y_start so DRAM readers
+        // are assigned to the correct partition rows (e.g. rows 5-9 for inst1).
         std::vector<uint32_t> worker_phy_y = std::vector<uint32_t>(num_cores_y);
         for (int i = 0; i < num_cores_y; ++i) {
-            auto core_phy = this->physical_worker_core_from_logical_core(CoreCoord(0, i));
+            auto core_phy = this->physical_worker_core_from_logical_core(CoreCoord(0, i + y_start));
             worker_phy_y.at(i) = core_phy.y;
         }
-        std::vector<uint32_t> worker_phy_x = std::vector<uint32_t>(num_cores_x);
+        std::vector<uint32_t> worker_phy_x(num_cores_x);
         for (int i = 0; i < num_cores_x; ++i) {
             auto core_phy = this->physical_worker_core_from_logical_core(CoreCoord(i, 0));
-            worker_phy_x.push_back(core_phy.x);
+            worker_phy_x.at(i) = core_phy.x;
         }
         // Get optimal placement of worker cores interfacing with DRAM Controllers in physical coordinate space
         auto physical_worker_cores = get_optimal_dram_to_physical_worker_assignment(
             this->arch(), dram_phy_coords, full_grid_size_x, full_grid_size_y, worker_phy_x, worker_phy_y);
 
         const metal_SocDescriptor& soc_desc = MetalEnvAccessor(*env_).impl().get_cluster().get_soc_desc(this->id_);
-        // Convert to physical worker coordinates to logical. This gets returned to the user.
-        for (auto physical_worker_core : physical_worker_cores) {
-            tt::umd::CoreCoord logical_coord_translated =
-                soc_desc.translate_coord_to(physical_worker_core, CoordSystem::NOC0, CoordSystem::LOGICAL);
-            this->optimal_dram_bank_to_logical_worker_assignment_.push_back(
-                CoreCoord(logical_coord_translated.x, logical_coord_translated.y));
-            TT_ASSERT(
-                logical_coord_translated.core_type == CoreType::TENSIX,
-                "Worker dram interface core {} should be a Tensix core, algorithm to place DRAM interfacing workers is "
-                "invalid",
-                logical_coord_translated.str());
+        // Convert physical worker coordinates to logical.
+        // For BH with a spatial partition: the DRAM-to-physical-worker assignment ignores worker_phy_y,
+        // so readers can fall outside the partition. Remap out-of-partition banks to unique rows
+        // within [y_start, y_start+num_cores_y-1], one row per x-column, to avoid duplicate logical
+        // coordinates in dest (which would cause SetRuntimeArgs arg-count conflicts in the factory).
+        if (has_spatial_override) {
+            // Translate all to logical first.
+            struct LogCore { uint32_t x, y; };
+            std::vector<LogCore> logical_cores;
+            for (auto physical_worker_core : physical_worker_cores) {
+                tt::umd::CoreCoord lc =
+                    soc_desc.translate_coord_to(physical_worker_core, CoordSystem::NOC0, CoordSystem::LOGICAL);
+                TT_ASSERT(
+                    lc.core_type == CoreType::TENSIX,
+                    "Worker dram interface core {} should be a Tensix core, algorithm to place DRAM interfacing "
+                    "workers is invalid",
+                    lc.str());
+                logical_cores.push_back({(uint32_t)lc.x, (uint32_t)lc.y});
+            }
+            // Track rows already claimed by in-partition banks, per x column.
+            std::map<uint32_t, std::set<uint32_t>> used_per_x;
+            for (auto& lc : logical_cores) {
+                if (lc.y >= y_start && lc.y < y_start + num_cores_y) {
+                    used_per_x[lc.x].insert(lc.y);
+                }
+            }
+            // Assign each bank: in-partition stays, out-of-partition gets a unique available slot.
+            // Search same column first; spill to adjacent columns when a column is fully claimed.
+            for (auto& lc : logical_cores) {
+                uint32_t final_x = lc.x;
+                uint32_t final_y = lc.y;
+                if (lc.y < y_start || lc.y >= y_start + num_cores_y) {
+                    bool below = (lc.y < y_start);
+                    bool found = false;
+                    // Try columns in order: original, then nearest neighbours outward.
+                    auto search_col = [&](uint32_t cx) -> bool {
+                        auto& ux = used_per_x[cx];
+                        if (below) {
+                            for (uint32_t dy = 0; dy < num_cores_y; ++dy) {
+                                uint32_t cand = y_start + dy;
+                                if (!ux.count(cand)) {
+                                    ux.insert(cand);
+                                    final_x = cx;
+                                    final_y = cand;
+                                    return true;
+                                }
+                            }
+                        } else {
+                            for (int dy = (int)num_cores_y - 1; dy >= 0; --dy) {
+                                uint32_t cand = y_start + (uint32_t)dy;
+                                if (!ux.count(cand)) {
+                                    ux.insert(cand);
+                                    final_x = cx;
+                                    final_y = cand;
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    };
+                    found = search_col(lc.x);
+                    for (uint32_t dx = 1; dx < num_cores_x && !found; ++dx) {
+                        if (lc.x + dx < num_cores_x)
+                            found = search_col(lc.x + dx);
+                        if (!found && lc.x >= dx)
+                            found = search_col(lc.x - dx);
+                    }
+                    TT_FATAL(
+                        found,
+                        "DRAM remap: no free partition slot for bank at logical ({}, {}). "
+                        "y_start={}, num_cores_y={}, num_dram_banks={}. "
+                        "All {} partition rows across all {} columns are claimed.",
+                        lc.x, lc.y, y_start, num_cores_y, num_dram_banks,
+                        num_cores_y, num_cores_x);
+                }
+                dest.push_back(CoreCoord(final_x, final_y));
+            }
+            // Assert no duplicate logical cores — a duplicate would silently corrupt SetRuntimeArgs.
+            {
+                std::set<std::pair<uint32_t, uint32_t>> seen;
+                for (const auto& c : dest) {
+                    TT_FATAL(
+                        seen.insert({c.x, c.y}).second,
+                        "DRAM reader map contains duplicate logical core ({}, {}). "
+                        "y_start={}, num_cores_y={}, num_dram_banks={}.",
+                        c.x, c.y, y_start, num_cores_y, num_dram_banks);
+                }
+            }
+        } else {
+            for (auto physical_worker_core : physical_worker_cores) {
+                tt::umd::CoreCoord lc =
+                    soc_desc.translate_coord_to(physical_worker_core, CoordSystem::NOC0, CoordSystem::LOGICAL);
+                TT_ASSERT(
+                    lc.core_type == CoreType::TENSIX,
+                    "Worker dram interface core {} should be a Tensix core, algorithm to place DRAM interfacing "
+                    "workers is invalid",
+                    lc.str());
+                dest.push_back(CoreCoord(lc.x, lc.y));
+            }
         }
     }
-    return this->optimal_dram_bank_to_logical_worker_assignment_;
+    return dest;
+}
+
+void Device::update_dram_bank_table_for_partition(
+    uint32_t y_start, uint32_t num_rows, uint32_t bank_start, uint32_t bank_count) {
+    MetalEnvImpl& env_impl = MetalEnvAccessor(*env_).impl();
+    auto& cluster = env_impl.get_cluster();
+    const auto& hal = env_impl.get_hal();
+    const metal_SocDescriptor& soc_d = cluster.get_soc_desc(id_);
+
+    bool noc_translation_enabled = true;
+    if (cluster.get_target_device_type() != tt::TargetDevice::Mock) {
+        noc_translation_enabled = cluster.get_cluster_desc()->get_noc_translation_table_en().at(id_);
+    }
+    bool dram_is_virtualized =
+        noc_translation_enabled && (hal.get_virtualized_core_types().contains(dev_msgs::AddressableCoreType::DRAM));
+
+    uint32_t num_dram_banks = num_dram_channels();
+    // bank_count == 0 means "full range" (backward-compatible default).
+    bool full_range = (bank_count == 0 || bank_count >= num_dram_banks);
+    uint32_t eff_start = full_range ? 0 : bank_start;
+    uint32_t eff_count = full_range ? num_dram_banks : bank_count;
+
+    // Build bank-table entries using each bank's OWN preferred NOC address (no cross-NOC
+    // substitution). Using translate_dram on the alt_noc address produces NOC0 physical
+    // coords even for preferred_noc=1, making the dist_y comparison wrong: NOC1 routes in
+    // the opposite ring direction, so a small NOC0 dist_y does NOT mean the NOC1 path is
+    // short. Substituting a NOC0 address into the NOC1 slot misroutes fill_cache packets.
+    //
+    // When bank_count < num_dram_banks, slot indices wrap within [eff_start, eff_start+eff_count)
+    // so all slots contain a valid address and interleaved allocations only touch the subset.
+    struct BankEntry { uint16_t packed; uint16_t noc_x, noc_y; };
+    auto make_entries = [&](int preferred_noc) -> std::vector<BankEntry> {
+        std::vector<BankEntry> entries(num_dram_banks);
+        for (uint32_t slot = 0; slot < num_dram_banks; ++slot) {
+            uint32_t bank = eff_start + (slot % eff_count);
+            CoreCoord chosen = soc_d.get_preferred_worker_core_for_dram_view(bank, preferred_noc);
+            uint16_t noc_x, noc_y;
+            if (dram_is_virtualized) {
+                noc_x = (uint16_t)chosen.x;
+                noc_y = (uint16_t)chosen.y;
+            } else {
+                noc_x = (uint16_t)hal.noc_coordinate(preferred_noc, soc_d.grid_size.x, chosen.x);
+                noc_y = (uint16_t)hal.noc_coordinate(preferred_noc, soc_d.grid_size.y, chosen.y);
+            }
+            entries[slot].packed =
+                (uint16_t)(((noc_y << hal.get_noc_addr_node_id_bits()) | noc_x) << hal.get_noc_coord_reg_offset());
+            entries[slot].noc_x = noc_x;
+            entries[slot].noc_y = noc_y;
+        }
+        return entries;
+    };
+
+    std::vector<BankEntry> noc0_entries = make_entries(0);
+    std::vector<BankEntry> noc1_entries = make_entries(1);
+
+    // Collect the packed uint16_t arrays for the wire writes.
+    std::vector<uint16_t> noc0_packed(num_dram_banks), noc1_packed(num_dram_banks);
+    for (uint32_t i = 0; i < num_dram_banks; ++i) {
+        noc0_packed[i] = noc0_entries[i].packed;
+        noc1_packed[i] = noc1_entries[i].packed;
+    }
+
+    const uint64_t bank_to_noc_addr =
+        hal.get_dev_addr(HalProgrammableCoreType::TENSIX, HalL1MemAddrType::BANK_TO_NOC_SCRATCH);
+    const uint32_t data_size = num_dram_banks * sizeof(uint16_t);
+
+    // Cap at 8: columns 0-7 are compute cores; columns 8+ are dispatch/ethernet and
+    // must not receive bank table writes (writing to their L1 at bank_to_noc_addr
+    // corrupts dispatch firmware, which causes fill_cache NOC deadlocks).
+    uint32_t num_cores_x = (uint32_t)std::min(compute_with_storage_grid_size().x, (size_t)8);
+    for (uint32_t lx = 0; lx < num_cores_x; ++lx) {
+        for (uint32_t ly = y_start; ly < y_start + num_rows; ++ly) {
+            CoreCoord virtual_core =
+                cluster.get_virtual_coordinate_from_logical_coordinates(id_, CoreCoord(lx, ly), CoreType::WORKER);
+            tt_cxy_pair dest(id_, virtual_core);
+            cluster.write_core(noc0_packed.data(), data_size, dest, bank_to_noc_addr);
+            cluster.write_core(noc1_packed.data(), data_size, dest, bank_to_noc_addr + data_size);
+        }
+    }
+    cluster.l1_barrier(id_);
+
 }
 
 HalProgrammableCoreType Device::get_programmable_core_type(CoreCoord virtual_core) const {

@@ -10,6 +10,11 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include "fill_cache_multi_core_program_factory.hpp"
 
+// Thread-local spatial partition helpers (set by _cpp_set_grid_v2).
+// Returns 0 when no spatial partition is active.
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 using namespace tt::tt_metal;
 
 namespace ttnn::prim {
@@ -42,9 +47,15 @@ FillCacheMultiCoreProgramFactory::cached_program_t FillCacheMultiCoreProgramFact
     tt::tt_metal::IDevice* device = input_tensor.device();
 
     auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
-    uint32_t num_cores_x = compute_with_storage_grid_size.x;
+    // Cap x at 8: columns 0-7 are compute cores; columns 8+ are dispatch/ethernet.
+    uint32_t num_cores_x = (uint32_t)std::min(compute_with_storage_grid_size.x, (size_t)8);
     uint32_t num_cores_y = compute_with_storage_grid_size.y;
 
+    // Respect the thread-local spatial partition so we don't dispatch onto cores
+    // that belong to another partition (or outside any partition entirely).
+    uint32_t sp_y  = tt_get_spatial_compute_grid_y();
+    uint32_t sp_y0 = sp_y > 0 ? tt_get_spatial_compute_grid_y_start() : 0u;
+    uint32_t effective_y = sp_y > 0 ? sp_y : num_cores_y;
     bool row_major;
     uint32_t num_cores, num_blocks_per_core_group_1, num_blocks_per_core_group_2;
 
@@ -74,7 +85,27 @@ FillCacheMultiCoreProgramFactory::cached_program_t FillCacheMultiCoreProgramFact
             core_group_2,
             num_blocks_per_core_group_1,
             num_blocks_per_core_group_2) =
-            tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, num_blocks_of_work, row_major);
+            tt::tt_metal::split_work_to_cores(
+                // Limit to 1 core to prevent NOC routing deadlock on Blackhole:
+                // 32-core fills generate concurrent DRAM traffic that deadlocks
+                // at specific DRAM address ranges (user_id=9, layer=18 in LLaMA-3.1-8B).
+                CoreCoord{1, 1}, num_blocks_of_work, row_major);
+
+        // Shift all core ranges up by the partition y-offset when sp_y0 > 0.
+        if (sp_y0 > 0) {
+            auto shift_crs = [sp_y0](const CoreRangeSet& crs) {
+                std::vector<CoreRange> shifted;
+                for (const auto& cr : crs.ranges()) {
+                    shifted.push_back(
+                        {{cr.start_coord.x, cr.start_coord.y + sp_y0},
+                         {cr.end_coord.x,   cr.end_coord.y + sp_y0}});
+                }
+                return CoreRangeSet(shifted);
+            };
+            all_cores    = shift_crs(all_cores);
+            core_group_1 = shift_crs(core_group_1);
+            core_group_2 = shift_crs(core_group_2);
+        }
         num_input_tiles = 2;  // double buffered
     }
 
@@ -117,7 +148,14 @@ FillCacheMultiCoreProgramFactory::cached_program_t FillCacheMultiCoreProgramFact
 
     uint32_t g1_numcores = core_group_1.num_cores();
 
-    const auto& cores = grid_to_cores(num_cores, num_cores_x, num_cores_y, row_major);
+    // Build the per-core work list in partition-row order, then apply the y-offset.
+    auto cores_base = grid_to_cores(num_cores, num_cores_x, effective_y, row_major);
+    std::vector<CoreCoord> cores;
+    cores.reserve(cores_base.size());
+    for (auto c : cores_base) {
+        c.y += sp_y0;
+        cores.push_back(c);
+    }
 
     for (uint32_t i = 0, num_blocks_written = 0; i < num_cores; i++) {
         const CoreCoord& core = cores.at(i);

@@ -3,10 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import os
+import sys
 import torch
 from tqdm import tqdm
 
 import ttnn
+
+_PREFILL_DEBUG_SYNC = os.environ.get("PREFILL_DEBUG_SYNC", "") == "1"
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.sampling.generator import SamplingGenerator
@@ -423,7 +427,7 @@ class Transformer(LightweightModule):
         ), f"Batch size {B} must be equal to max_batch_size {self.args.max_batch_size}"
 
         # Necessary padding to be full tile sized when on device
-        tokens = torch.nn.functional.pad(tokens.view(-1), (0, 32 - len(tokens)), "constant", 0)
+        tokens = torch.nn.functional.pad(tokens.view(-1), (0, (32 - len(tokens) % 32) % 32), "constant", 0)
         tokens = ttnn.from_torch(
             tokens,
             device=None,
@@ -682,6 +686,10 @@ class Transformer(LightweightModule):
             if self.prefetcher is not None:
                 self.prefetcher.run()
 
+        import sys as _sys
+        from models.tt_transformers.tt.attention import set_attn_debug_sync
+        _debug_sync = getattr(self, '_debug_layer_sync', False)
+        _cq_id = getattr(self, '_debug_cq_id', 0)
         for i, layer in enumerate(self.layers):
             # No-op if callers already provide the right memory config
             activation_dtype = self.args.decoders_optimizations.get_tensor_dtype(
@@ -697,6 +705,8 @@ class Transformer(LightweightModule):
             elif activation_dtype is not None and x.dtype != activation_dtype:
                 x = ttnn.typecast(x, activation_dtype)
 
+            if _debug_sync and mode == Mode.DECODE:
+                set_attn_debug_sync(True, self.mesh_device, _cq_id)
             x = layer(
                 x,
                 current_pos,
@@ -710,6 +720,15 @@ class Transformer(LightweightModule):
                 kv_cache=kv_cache[i] if kv_cache is not None else None,
                 batch_size=batch_size,
             )
+            if _PREFILL_DEBUG_SYNC and mode == Mode.PREFILL:
+                print(f"[PREFILL_DBG] user_id={user_id} layer={i} syncing...", file=sys.stderr, flush=True)
+                ttnn.synchronize_device(self.mesh_device)
+                print(f"[PREFILL_DBG] user_id={user_id} layer={i} done", file=sys.stderr, flush=True)
+            if _debug_sync and mode == Mode.DECODE:
+                set_attn_debug_sync(False)
+                print(f"[LAYER_SYNC] layer={i} syncing cq_id={_cq_id}", file=_sys.stderr, flush=True)
+                ttnn.synchronize_device(self.mesh_device, cq_id=_cq_id)
+                print(f"[LAYER_SYNC] layer={i} done", file=_sys.stderr, flush=True)
 
         if mode == Mode.DECODE:
             if self.prefetcher is not None:

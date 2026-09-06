@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Union
 import torch
 from PIL import Image
 from pydantic import BaseModel, validator
-from transformers import AutoModelForVision2Seq, AutoProcessor, pipeline
+from transformers import AutoProcessor, pipeline
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    # transformers ≥5.0 renamed AutoModelForVision2Seq → AutoModelForImageTextToText
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
 
 class Role(Enum):

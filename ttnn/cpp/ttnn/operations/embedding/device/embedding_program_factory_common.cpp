@@ -4,6 +4,8 @@
 
 #include "embedding_program_factory_common.hpp"
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 CoreSplitResult split_work_to_cores_aligned(
@@ -47,6 +49,25 @@ CoreSplitResult split_work_to_cores_aligned(
     // Adjust the units per core for each group
     uint32_t units_per_core_group_1 = units_per_core;
     uint32_t units_per_core_group_2 = remaining_units < units_per_core ? remaining_units : 0;
+
+    uint32_t y_start = tt_get_spatial_compute_grid_y_start();
+    if (y_start > 0) {
+        auto shift_crs = [y_start](const CoreRangeSet& crs) {
+            std::vector<CoreRange> shifted;
+            shifted.reserve(crs.ranges().size());
+            for (const auto& r : crs.ranges()) {
+                shifted.emplace_back(
+                    CoreCoord(r.start_coord.x, r.start_coord.y + y_start),
+                    CoreCoord(r.end_coord.x, r.end_coord.y + y_start));
+            }
+            return CoreRangeSet(std::move(shifted));
+        };
+        all_cores = shift_crs(all_cores);
+        core_group_1 = shift_crs(core_group_1);
+        if (!core_group_2.ranges().empty()) {
+            core_group_2 = shift_crs(core_group_2);
+        }
+    }
 
     return CoreSplitResult{
         required_cores, all_cores, core_group_1, core_group_2, units_per_core_group_1, units_per_core_group_2};

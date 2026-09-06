@@ -35,7 +35,24 @@ class TT_CCL:
         self,
         mesh_device,
     ):
-        self.mesh_device = mesh_device
+        # Unwrap SpatialDevice wrapper: pybind11 needs the real MeshDevice
+        self.mesh_device = getattr(mesh_device, '_device', mesh_device)
+
+        # sub_device_crs must use the full device's absolute coordinate space.
+        # Temporarily clear the spatial partition so the patched CoreCoord does
+        # not add a y_offset; otherwise the bottom partition (y_offset=5) would
+        # shift coordinates like CoreCoord(7,9) → CoreCoord(7,14) which is
+        # out of bounds on a 10-row device.
+        _saved_partition = None
+        try:
+            from models.tt_transformers.tt.spatial_core import (
+                set_spatial_partition, _y_offset, _max_y, _x_offset, _max_x
+            )
+            _saved_partition = (_y_offset(), _max_y(), _x_offset(), _max_x())
+            set_spatial_partition(y_offset=0, max_y=10, x_offset=0, max_x=13)
+        except Exception:
+            pass
+
         self.sub_device_crs = ttnn.CoreRangeSet(
             {
                 ttnn.CoreRange(
@@ -47,6 +64,13 @@ class TT_CCL:
                 )
             }
         )
+
+        if _saved_partition is not None:
+            from models.tt_transformers.tt.spatial_core import set_spatial_partition
+            set_spatial_partition(
+                y_offset=_saved_partition[0], max_y=_saved_partition[1],
+                x_offset=_saved_partition[2], max_x=_saved_partition[3],
+            )
 
         self.barrier_semaphore_idx = [0, 0, 0]
         self.barrier_semaphore_handles = [[], [], []]

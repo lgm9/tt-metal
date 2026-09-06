@@ -5,6 +5,8 @@
 #include "embeddings_fused_program_factory.hpp"
 #include "embedding_program_factory_common.hpp"
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 EmbeddingsFusedProgramFactory::cached_program_t EmbeddingsFusedProgramFactory::create(
@@ -72,6 +74,22 @@ EmbeddingsFusedProgramFactory::cached_program_t EmbeddingsFusedProgramFactory::c
             tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, num_blocks);
         num_tiles_per_block = weights.padded_shape()[-1] / TILE_WIDTH;
         row_major = false;
+        uint32_t y_start = tt_get_spatial_compute_grid_y_start();
+        if (y_start > 0) {
+            auto shift_crs = [y_start](CoreRangeSet& crs) {
+                std::vector<CoreRange> shifted;
+                shifted.reserve(crs.ranges().size());
+                for (const auto& r : crs.ranges()) {
+                    shifted.emplace_back(
+                        CoreCoord(r.start_coord.x, r.start_coord.y + y_start),
+                        CoreCoord(r.end_coord.x, r.end_coord.y + y_start));
+                }
+                crs = CoreRangeSet(std::move(shifted));
+            };
+            shift_crs(all_cores);
+            shift_crs(core_group_1);
+            if (!core_group_2.ranges().empty()) { shift_crs(core_group_2); }
+        }
     }
     uint32_t g1_numcores = core_group_1.num_cores();
 

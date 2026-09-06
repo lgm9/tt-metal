@@ -10,6 +10,32 @@
 
 using namespace tt::tt_metal;
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
+namespace {
+// Returns workers for the active spatial partition, or sub_device_ids().front() when
+// no partition is active.  Fixes the .front() bug for interleaved-tensor fallback paths.
+CoreRangeSet partition_workers(IDevice* device) {
+    const uint32_t y = tt_get_spatial_compute_grid_y();
+    if (y == 0) {
+        return device->worker_cores(HalProgrammableCoreType::TENSIX, device->get_sub_device_ids().front());
+    }
+    const uint32_t y0 = tt_get_spatial_compute_grid_y_start();
+    for (const auto& sub_device_id : device->get_sub_device_ids()) {
+        const auto& workers = device->worker_cores(HalProgrammableCoreType::TENSIX, sub_device_id);
+        if (!workers.ranges().empty()) {
+            const auto& r = workers.ranges().front();
+            if (r.start_coord.y == y0 && r.end_coord.y == y0 + y - 1) {
+                return workers;
+            }
+        }
+    }
+    const auto g = device->compute_with_storage_grid_size();
+    return CoreRangeSet(CoreRange({0, y0}, {g.x - 1, y0 + y - 1}));
+}
+}  // namespace
+
 namespace ttnn::operations::binary_ng {
 
 namespace utils {
@@ -119,6 +145,15 @@ CoreRangeSet get_worker_grid(
         return sub_core_grids.value();
     }
 
+    // Spatial-partition fast path: shard spec grids use sub-device-relative (0-based)
+    // row indices that are identical for both partitions, so the intersection check below
+    // would pick the wrong sub_device for any non-zero-start partition.
+    // When a partition is active, trust it unconditionally.
+    if (tt_get_spatial_compute_grid_y() > 0) {
+        auto* device = input_tensor_a.device();
+        return partition_workers(device);
+    }
+
     auto get_tensor_grid = [](const Tensor& tensor) -> CoreRangeSet {
         const auto& grid = tensor.shard_spec()->grid;
         auto* device = tensor.device();
@@ -163,7 +198,7 @@ CoreRangeSet get_worker_grid(
         log_debug(
             tt::LogOp, "Using all worker cores of the device for worker grid, output or memory config not sharded");
         auto* device = input_tensor_a.device();
-        return device->worker_cores(HalProgrammableCoreType::TENSIX, device->get_sub_device_ids().front());
+        return partition_workers(device);
     }
 
     if (is_native_L1_sharding(
@@ -188,7 +223,7 @@ CoreRangeSet get_worker_grid(
     // use all worker cores of the device
     log_debug(tt::LogOp, "Using all worker cores of the device for worker grid");
     auto* device = input_tensor_a.device();
-    return device->worker_cores(HalProgrammableCoreType::TENSIX, device->get_sub_device_ids().front());
+    return partition_workers(device);
 }
 
 SubtileBroadcastType get_subtile_broadcast_type(uint32_t a_h, uint32_t a_w, uint32_t b_h, uint32_t b_w) {
@@ -235,6 +270,7 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::operation_attributes_t::to_hash() co
         get_dtype(),
         compute_kernel_config,
         sub_core_grids,
+        worker_grid,   // partition-aware: different spatial partitions get separate programs
         subtile_broadcast_type,
         is_sfpu,
         is_quant_op,
@@ -473,11 +509,13 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::compute_program_hash(
             input_tensor_a.memory_config(),
             input_tensor_b->dtype(),
             input_tensor_b->memory_config(),
-            shard_volumes);
+            shard_volumes,
+            tt_get_spatial_compute_grid_y_start());
     }
 
     return operation::hash_operation<BinaryNgDeviceOperation>(
-        attributes, input_tensor_a.dtype(), input_tensor_a.memory_config());
+        attributes, input_tensor_a.dtype(), input_tensor_a.memory_config(),
+        tt_get_spatial_compute_grid_y_start());
 }
 
 bool BinaryNgDeviceOperation::skip_launch(

@@ -84,7 +84,7 @@ add_dependencies(distributed metalium_GeneratedHeaders)
 
 if(USE_MPI)
     target_link_libraries(distributed PRIVATE OpenMPI::MPI)
-    target_compile_definitions(distributed PRIVATE OPEN_MPI="1")
+    target_compile_definitions(distributed PRIVATE OPEN_MPI=1)
 endif()
 
 target_include_directories(distributed SYSTEM PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/flatbuffers)

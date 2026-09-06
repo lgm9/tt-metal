@@ -738,7 +738,7 @@ MeshEvent FDMeshCommandQueue::enqueue_record_event_helper(
             mesh_device_->impl().get_device(coord)->id(),
             event.id(),
             id_,
-            mesh_device_->num_hw_cqs(),
+            1,  // write only to this CQ's dispatch_d; avoid NOC writes to other CQs during concurrent execution
             mesh_device_->impl().get_device(coord)->sysmem_manager(),
             sub_device_ids,
             expected_num_workers_completed_,
@@ -1130,11 +1130,6 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
     auto descriptor = trace_inst->desc;
     auto buffer = trace_inst->mesh_buffer;
     uint32_t num_sub_devices = descriptor->sub_device_ids.size();
-    auto& sub_device_cq_owner = cq_shared_state_->sub_device_cq_owner;
-    for (auto sub_device_id : descriptor->sub_device_ids) {
-        auto& sub_device = sub_device_cq_owner[*sub_device_id];
-        sub_device.take_ownership(sub_device_id, this->id_);
-    }
 
     auto cmd_sequence_sizeB = trace_dispatch::compute_trace_cmd_size(num_sub_devices);
 

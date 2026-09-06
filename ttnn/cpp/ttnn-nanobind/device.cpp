@@ -542,6 +542,18 @@ void device_module(nb::module_& m_device) {
         )doc");
 
     m_device.def(
+        "update_dram_bank_table_for_partition",
+        [](MeshDevice* device, uint32_t y_start, uint32_t num_rows,
+           uint32_t bank_start, uint32_t bank_count) {
+            device->update_dram_bank_table_for_partition(y_start, num_rows, bank_start, bank_count);
+        },
+        nb::arg("device"),
+        nb::arg("y_start"),
+        nb::arg("num_rows"),
+        nb::arg("bank_start") = 0,
+        nb::arg("bank_count") = 0);
+
+    m_device.def(
         "enable_asynchronous_slow_dispatch",
         [](tt::tt_metal::distributed::MeshDevice* device) {
             tt::tt_metal::experimental::DispatchContext::get().enable_asynchronous_slow_dispatch(device);

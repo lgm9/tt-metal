@@ -199,6 +199,13 @@ std::vector<CoreCoord> get_optimal_dram_to_physical_worker_assignment(
         }
         dram_interface_workers.push_back(CoreCoord(dram_core.x + 1, dram_core_y));
     }
+    // NOTE(locality): When a spatial partition is active, some banks' "ideal" rows are outside
+    // the partition and get remapped by device.cpp's get_optimal_dram_bank_to_logical_worker_assignment.
+    // The current approach places those banks at the partition's nearest edge row, creating
+    // asymmetric hop distances (avg 3.5 hops for inst0, 2.9 hops for inst1 on P150a).
+    // A better solution: restructure the remap loop in device.cpp to handle both in-partition and
+    // out-of-partition banks in a single unified assignment pass, sorting banks by distance to
+    // available partition rows and assigning greedily. Deferred pending the concurrent deadlock fix.
 
     if (arch == ARCH::WORMHOLE_B0) {
         // Reassign worker cores based on harvesting for WH.

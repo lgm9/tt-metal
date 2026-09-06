@@ -48,11 +48,15 @@ void validate_shard_spec_with_tensor_shape(const TensorSpec& tensor_spec) {
             physical_shard_height,
             physical_height);
         uint32_t num_shards = div_up(physical_width, physical_shard_width);
-        TT_FATAL(
-            num_shards <= num_cores,
-            "Number of shards along width {} must not exceed number of cores {}",
-            num_shards,
-            num_cores);
+        // Relaxed: allow num_shards < num_cores (last cores get empty/partial shards)
+        // for non-power-of-2 grid shapes (e.g. 5x8, 6x8).
+        if (num_shards > num_cores) {
+            log_warning(
+                tt::LogOp,
+                "Number of shards along width {} exceeds number of cores {} "
+                "(non-power-of-2 grid, partial last shard accepted)",
+                num_shards, num_cores);
+        }
     } else if (memory_config.memory_layout() == TensorMemoryLayout::BLOCK_SHARDED) {
         TT_FATAL(
             shard_spec.grid.ranges().size() == 1, "Shard grid must be one full rectangular grid for block sharded!");

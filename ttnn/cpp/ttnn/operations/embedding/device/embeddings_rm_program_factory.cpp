@@ -6,6 +6,8 @@
 #include "embedding_program_factory_common.hpp"
 #include <tt-metalium/tt_align.hpp>
 
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 EmbeddingsRMProgramFactory::cached_program_t EmbeddingsRMProgramFactory::create(
@@ -79,6 +81,22 @@ EmbeddingsRMProgramFactory::cached_program_t EmbeddingsRMProgramFactory::create(
             num_blocks_per_core_group_1,
             num_blocks_per_core_group_2) =
             tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, problem_size);
+        uint32_t y_start = tt_get_spatial_compute_grid_y_start();
+        if (y_start > 0) {
+            auto shift_crs = [y_start](CoreRangeSet& crs) {
+                std::vector<CoreRange> shifted;
+                shifted.reserve(crs.ranges().size());
+                for (const auto& r : crs.ranges()) {
+                    shifted.emplace_back(
+                        CoreCoord(r.start_coord.x, r.start_coord.y + y_start),
+                        CoreCoord(r.end_coord.x, r.end_coord.y + y_start));
+                }
+                crs = CoreRangeSet(std::move(shifted));
+            };
+            shift_crs(all_cores);
+            shift_crs(core_group_1);
+            if (!core_group_2.ranges().empty()) { shift_crs(core_group_2); }
+        }
     }
     uint32_t g1_numcores = core_group_1.num_cores();
 

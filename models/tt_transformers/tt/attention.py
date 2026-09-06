@@ -3,11 +3,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+import sys
+import threading
 
 import torch
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+
+# Fine-grained per-op sync for debugging decode hangs
+_attn_sync_state = threading.local()
+
+def set_attn_debug_sync(enabled: bool, mesh_device=None, cq_id: int = 0) -> None:
+    _attn_sync_state.enabled = enabled
+    _attn_sync_state.mesh_device = mesh_device
+    _attn_sync_state.cq_id = cq_id
+
+def _attn_sync(label: str) -> None:
+    if getattr(_attn_sync_state, 'enabled', False):
+        print(f"[ATTN_SYNC] {label} syncing cq={_attn_sync_state.cq_id}", file=sys.stderr, flush=True)
+        ttnn.synchronize_device(_attn_sync_state.mesh_device, cq_id=_attn_sync_state.cq_id)
+        print(f"[ATTN_SYNC] {label} done", file=sys.stderr, flush=True)
+
 from models.common.rmsnorm import RMSNorm
 from models.common.utility_functions import nearest_32
 from models.tt_transformers.tt.ccl import tt_all_gather, tt_all_reduce
@@ -616,6 +634,7 @@ class Attention(LightweightModule):
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
             sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
         )
+        _attn_sync("after wqkv")
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
             # select the bias tensor based on the number of tiles in the rows
@@ -658,7 +677,7 @@ class Attention(LightweightModule):
         # Reshape such that true unpadded batch is tracked in shape
         fqkv_shape = xqkv_fused.shape
         xqkv_fused = ttnn.reshape(
-            xqkv_fused, (1, 1, self.batch_size_per_device_group, fqkv_shape[3]), (1, 1, 32, fqkv_shape[3])
+            xqkv_fused, (1, 1, self.batch_size_per_device_group, fqkv_shape[3]), (1, 1, self.tile_size * math.ceil(self.batch_size_per_device_group / self.tile_size), fqkv_shape[3])
         )
 
         ###
@@ -744,6 +763,7 @@ class Attention(LightweightModule):
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,  # FIXME: why not L1 height sharded e.g. SCORES_BATCHED_MM_OUTPUT_MEMCFG?
             )
 
+        _attn_sync("after sdpa")
         ttnn.deallocate(q_heads_1BQD)
         attn_output_11BH = ttnn.to_memory_config(
             attn_output_1G4D,
@@ -752,11 +772,31 @@ class Attention(LightweightModule):
             ),
         )
 
+        _nlp_sub_core_grids = self.prefetcher.all_worker_cores_range_set if self.prefetcher is not None else None
+        if _nlp_sub_core_grids is None:
+            try:
+                from models.tt_transformers.tt.spatial_core import _y_offset, _max_y
+                if _max_y() < 10:
+                    # Any spatial partition (top or bottom): nlp_concat_heads_decode uses the
+                    # full device grid without sub_core_grids, which spans both sub-devices and
+                    # causes a FATAL when the spatial sub-device manager is active.
+                    # CoreCoord(0, 0) and CoreCoord(7, max_y-1) get shifted by the thread-local
+                    # y_offset via the spatial_core patch, giving the correct absolute rows.
+                    import sys; print(f"[NLP_FIX] y_offset={_y_offset()} max_y={_max_y()} setting sub_core_grids rows 0-{_max_y()-1}", flush=True, file=sys.stderr)
+                    _nlp_sub_core_grids = ttnn.CoreRangeSet({
+                        ttnn.CoreRange(
+                            ttnn.CoreCoord(0, 0),
+                            ttnn.CoreCoord(7, _max_y() - 1),
+                        )
+                    })
+            except Exception:
+                pass
         attn_output_cat = ttnn.experimental.nlp_concat_heads_decode(
             attn_output_11BH,
             num_heads=self.n_local_heads,
-            sub_core_grids=self.prefetcher.all_worker_cores_range_set if self.prefetcher is not None else None,
+            sub_core_grids=_nlp_sub_core_grids,
         )
+        _attn_sync("after nlp_concat")
         ttnn.deallocate(attn_output_11BH)
         ttnn.deallocate(attn_output_1G4D)
 
@@ -844,6 +884,13 @@ class Attention(LightweightModule):
                     memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 )
 
+            # Ensure attn_output has the shard expected by ATTN_OUTPUT_PROGCFG.
+            # For batch > 32 the matmul uses 8 worker cores (shard_w = dim/8), so we
+            # reshard from nlp_concat_heads_decode's output to SHARDED_ATTN_INPUT_MEMCFG.
+            if not self.TG:
+                attn_output = ttnn.to_memory_config(
+                    attn_output, self.model_config["SHARDED_ATTN_INPUT_MEMCFG"]
+                )
             # TODO: Fix this once self.TG supports dram-sharded matmuls
             dense_out_sharded = ttnn.linear(
                 attn_output,
@@ -856,6 +903,7 @@ class Attention(LightweightModule):
                 global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
                 sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
             )
+            _attn_sync("after wo")
 
             ttnn.deallocate(attn_output_cat)
 
@@ -937,6 +985,11 @@ class Attention(LightweightModule):
                 program_config=self.args.get_attn_qkv_program_config(Mode.PREFILL, seq_len, None),
             )
 
+        # Fence: qkv_matmul reads 25 MB wqkv weight — flush before nlp_create
+        # reads from xqkv_fused, otherwise the combined DRAM traffic can deadlock
+        # the NOC on Blackhole (observed at user_id=9, layer=18).
+        ttnn.synchronize_device(self.mesh_device)
+
         # FIXME: surely ttnn.linear bias should work?
         if self.wqkv_bias_prefill is not None:
             xqkv_fused = xqkv_fused + self.wqkv_bias_prefill
@@ -975,7 +1028,6 @@ class Attention(LightweightModule):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-
         norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
         q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
         k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
@@ -1026,6 +1078,11 @@ class Attention(LightweightModule):
             # If chunked prefill, use chunk_page_table if given, otherwise use page_table.
             fill_page_table = chunk_page_table if chunk_page_table is not None else page_table
 
+        # Fence: flush all in-flight ops (typecast, rotary, etc.) before fill_cache
+        # issues its DRAM writes. Concurrent DRAM traffic from preceding unary ops
+        # causes a NOC-level deadlock on Blackhole (observed at user_id=9, layer=18).
+        ttnn.synchronize_device(self.mesh_device)
+
         if batch_size > 1:
             # For batched prefill, loop over VALID users only and fill each user's cache separately
             # k_fill/v_fill have shape [padded_batch, n_kv_heads, seq_len_per_user, head_dim]
@@ -1073,6 +1130,9 @@ class Attention(LightweightModule):
                 v_fill,
                 user_id % self.batch_size_per_device_group,
             )
+        # Fence: ensure fill_cache DRAM writes are committed before subsequent
+        # ops (typecast_Q, SDPA) run concurrently and generate competing NOC traffic.
+        ttnn.synchronize_device(self.mesh_device)
         if seq_len >= self.min_kv_prefill_shard_seqlen and not self.TG and not page_table:
             ttnn.deallocate(k_fill)
             ttnn.deallocate(v_fill)
@@ -1157,6 +1217,10 @@ class Attention(LightweightModule):
                 num_buffers_per_channel=2,
             )
 
+        # Fence: ensure SDPA + nlp_concat_heads complete before wo_matmul reads its
+        # input. Concurrent SDPA reads + wo_matmul weight reads can saturate the NOC
+        # on Blackhole and deadlock (observed at user_id=9, layer=18).
+        ttnn.synchronize_device(self.mesh_device)
         output_11SH = ttnn.linear(
             attn_output_11SH,
             self.wo,
@@ -1182,7 +1246,10 @@ class Attention(LightweightModule):
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 dtype=self.ccl_dtype,
             )
-
+        # Fence: ensure wo_matmul (16 MB W_out read) completes before returning.
+        # Without this, decoder.py dispatches add/ff_norm/MLP concurrently with
+        # the in-flight wo_matmul, saturating the NOC on Blackhole.
+        ttnn.synchronize_device(self.mesh_device)
         return output_11SH
 
     def forward(

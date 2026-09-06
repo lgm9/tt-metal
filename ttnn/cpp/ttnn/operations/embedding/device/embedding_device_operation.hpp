@@ -8,6 +8,7 @@
 
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/decorators.hpp"
+#include "ttnn/operation.hpp"
 
 #include "embedding_device_operation_types.hpp"
 #include "embeddings_fused_program_factory.hpp"
@@ -35,6 +36,8 @@ struct EmbeddingsDeviceOperation {
 
     static tensor_return_value_t create_output_tensors(
         const operation_attributes_t& operation_attributes, const tensor_args_t&);
+
+    static ttsl::hash::hash_t compute_program_hash(const operation_attributes_t&, const tensor_args_t&);
 };
 
 Tensor embedding(

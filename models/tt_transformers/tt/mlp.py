@@ -6,6 +6,7 @@ import torch
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+from models.tt_transformers.tt.attention import _attn_sync
 from models.tt_transformers.tt.ccl import tt_all_reduce
 from models.tt_transformers.tt.common import Mode, pad_to_size
 from models.tt_transformers.tt.model_config import OpGroup, TensorGroup
@@ -168,6 +169,7 @@ class MLP(LightweightModule):
             if self.prefetcher is not None and mode == Mode.DECODE
             else None,
         )
+        _attn_sync("after w1_w3")
         ttnn.deallocate(x)
 
         if TG:
@@ -293,6 +295,7 @@ class MLP(LightweightModule):
                 if self.prefetcher is not None and mode == Mode.DECODE
                 else None,
             )
+        _attn_sync("after w2")
         ttnn.deallocate(w2_in)
 
         w2_out_reduced = tt_all_reduce(

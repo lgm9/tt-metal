@@ -117,12 +117,14 @@ void issue_record_event_commands(
     std::vector<CQDispatchWritePackedUnicastSubCmd> unicast_sub_cmds(num_command_queues);
     std::vector<std::pair<const void*, uint32_t>> event_payloads(num_command_queues);
 
-    for (auto cq_id = 0; cq_id < num_command_queues; cq_id++) {
-        tt_cxy_pair dispatch_location = MetalContext::instance().get_dispatch_query_manager().get_dispatch_core(cq_id);
+    // Iterate [cq_id, cq_id + num_command_queues) so each CQ only writes to its own dispatch_d.
+    for (uint32_t i = 0; i < num_command_queues; i++) {
+        uint8_t target_cq_id = cq_id + i;
+        tt_cxy_pair dispatch_location = MetalContext::instance().get_dispatch_query_manager().get_dispatch_core(target_cq_id);
         CoreCoord dispatch_virtual_core = device->virtual_core_from_logical_core(dispatch_location, dispatch_core_type);
-        unicast_sub_cmds[cq_id] = CQDispatchWritePackedUnicastSubCmd{
+        unicast_sub_cmds[i] = CQDispatchWritePackedUnicastSubCmd{
             .noc_xy_addr = device->get_noc_unicast_encoding(k_dispatch_downstream_noc, dispatch_virtual_core)};
-        event_payloads[cq_id] = {event_payload.data(), event_payload.size() * sizeof(uint32_t)};
+        event_payloads[i] = {event_payload.data(), event_payload.size() * sizeof(uint32_t)};
     }
 
     uint32_t completion_q0_last_event_addr = MetalContext::instance().dispatch_mem_map().get_device_command_queue_addr(

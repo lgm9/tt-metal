@@ -526,6 +526,16 @@ void py_module(nb::module_& mod) {
                     ...     print(f"DRAM bank {i} -> worker core ({core.x}, {core.y})")
             )doc")
         .def(
+            "update_dram_bank_table_for_partition",
+            [](MeshDevice& self, uint32_t y_start, uint32_t num_rows,
+               uint32_t bank_start, uint32_t bank_count) {
+                self.update_dram_bank_table_for_partition(y_start, num_rows, bank_start, bank_count);
+            },
+            nb::arg("y_start"),
+            nb::arg("num_rows"),
+            nb::arg("bank_start") = 0,
+            nb::arg("bank_count") = 0)
+        .def(
             "get_worker_noc_hop_distance",
             [](MeshDevice& self, const CoreCoord& logical_src, const CoreCoord& logical_dst, NOC noc) {
                 return tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(

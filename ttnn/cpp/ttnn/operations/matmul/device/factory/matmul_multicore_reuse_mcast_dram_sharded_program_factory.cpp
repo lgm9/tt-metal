@@ -16,6 +16,10 @@
 #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 
+// Thread-local spatial partition helpers (defined in mesh_device.cpp).
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 using namespace tt;
 
 using ttnn::operations::unary::UnaryOpType;
@@ -77,29 +81,11 @@ create_program_dram_sharded(
 
     tt_metal::Program program{};
 
-    uint32_t start_core_x = 0;
-    uint32_t start_core_y = 0;
-    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
-    uint32_t num_mcast_cores = compute_with_storage_grid_size.x * compute_with_storage_grid_size.y;
-
-    CoreCoord top_left_core = {(std::size_t)start_core_x, (std::size_t)start_core_y};
-    CoreCoord bottom_right_core = {
-        (std::size_t)start_core_x + compute_with_storage_grid_size.x - 1,
-        (std::size_t)start_core_y + compute_with_storage_grid_size.y - 1};
-    auto top_left_core_physical = device->worker_core_from_logical_core(top_left_core);
-    auto bottom_right_core_physical = device->worker_core_from_logical_core(bottom_right_core);
-
     // in1 is the reader of weights/output writer, and we choose to make it use the optimized reader noc
     tt_metal::NOC in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
     tt_metal::NOC in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
 
-    CoreCoord start_core_noc = top_left_core_physical;
-    CoreCoord end_core_noc = bottom_right_core_physical;
-    if (in0_noc == tt::tt_metal::NOC::NOC_1) {
-        std::swap(start_core_noc, end_core_noc);
-    }
-
-    // get the dram readers
+    // get the dram readers (must come before bounding-box computation)
     std::vector<CoreCoord> all_worker_cores_ordered;
     CoreRangeSet all_worker_cores;
     get_optimal_dram_bank_to_reader_assignment(device, all_worker_cores_ordered, all_worker_cores, in1_noc);
@@ -111,6 +97,54 @@ create_program_dram_sharded(
     }
     for ([[maybe_unused]] auto core : all_worker_cores_ordered) {
         log_debug(tt::LogOp, "all_worker_cores_ordered: {}", core);
+    }
+
+    // Derive the NOC multicast bounding box from the actual sender+receiver cores.
+    // compute_with_storage_grid_size() is wrong here for two reasons:
+    //   (a) DRAM workers can land on rows outside the compute grid (e.g. rows 8-9 on a
+    //       10-row device), so those TYPE 3 receivers would never get the VALID signal.
+    //   (b) On sub-device partitions the call returns the full device, causing multicasts
+    //       to cross sub-device boundaries and corrupt the adjacent partition's L1.
+    uint32_t num_mcast_cores;
+    CoreCoord top_left_core;
+    CoreCoord bottom_right_core;
+    {
+        // Compute bounding box directly from range min/max to avoid CoreRangeSet
+        // overlap validation errors when worker cores fall inside the storage range.
+        CoreCoord bb_min = {std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()};
+        CoreCoord bb_max = {0, 0};
+        auto expand = [&](const CoreRange& cr) {
+            bb_min.x = std::min(bb_min.x, cr.start_coord.x);
+            bb_min.y = std::min(bb_min.y, cr.start_coord.y);
+            bb_max.x = std::max(bb_max.x, cr.end_coord.x);
+            bb_max.y = std::max(bb_max.y, cr.end_coord.y);
+        };
+        for (const auto& cr : input_all_storage_cores.ranges()) expand(cr);
+        for (const auto& cr : all_worker_cores.ranges()) expand(cr);
+        num_mcast_cores = (bb_max.x - bb_min.x + 1) * (bb_max.y - bb_min.y + 1);
+        top_left_core = bb_min;
+        bottom_right_core = bb_max;
+    }
+    // Assert mcast bounding box stays within the active spatial partition (if any).
+    // A box that spans partition rows would multicast into the adjacent partition's L1.
+    {
+        uint32_t sp_y = tt_get_spatial_compute_grid_y();
+        if (sp_y > 0) {
+            uint32_t sp_y0 = tt_get_spatial_compute_grid_y_start();
+            TT_FATAL(
+                top_left_core.y >= sp_y0 && bottom_right_core.y < sp_y0 + sp_y,
+                "Mcast bounding box y=[{},{}] crosses spatial partition boundary [y_start={}, y_end={}]. "
+                "DRAM readers or shard grid are not confined to the active partition.",
+                top_left_core.y, bottom_right_core.y, sp_y0, sp_y0 + sp_y - 1);
+        }
+    }
+    auto top_left_core_physical = device->worker_core_from_logical_core(top_left_core);
+    auto bottom_right_core_physical = device->worker_core_from_logical_core(bottom_right_core);
+
+    CoreCoord start_core_noc = top_left_core_physical;
+    CoreCoord end_core_noc = bottom_right_core_physical;
+    if (in0_noc == tt::tt_metal::NOC::NOC_1) {
+        std::swap(start_core_noc, end_core_noc);
     }
 
     // Remove cores assigned to padding-only DRAM banks from the workers category
@@ -241,6 +275,33 @@ create_program_dram_sharded(
     std::vector<CoreCoord> storage_worker_common;
     move_common_entries(input_all_storage_cores_vec, all_worker_cores_vec, storage_worker_common);
 
+    // move_common_entries only removes hybrids from v2 (all_worker_cores_vec), not from v1.
+    // Remove them from input_all_storage_cores_vec so it contains only pure TYPE 1 cores;
+    // without this the trim loop below double-counts hybrids and pops too many TYPE 1 entries.
+    for (const auto& hybrid : storage_worker_common) {
+        auto it = std::remove(input_all_storage_cores_vec.begin(), input_all_storage_cores_vec.end(), hybrid);
+        input_all_storage_cores_vec.erase(it, input_all_storage_cores_vec.end());
+    }
+
+    // Non-power-of-2 grid support: trim pure TYPE 1 senders until num_blocks is evenly
+    // divisible by total active senders (pure TYPE 1 + hybrid TYPE 2 cores).
+    // Hybrid cores in storage_worker_common act as TYPE 2 (send + compute) and must be
+    // counted; trimming only from the pure TYPE 1 list keeps hybrids fully active.
+    {
+        auto total_senders = [&]() {
+            return (uint32_t)(input_all_storage_cores_vec.size() + storage_worker_common.size());
+        };
+        while (!input_all_storage_cores_vec.empty() && num_blocks % total_senders() != 0) {
+            input_all_storage_cores_vec.pop_back();
+        }
+        if (total_senders() < (uint32_t)num_blocks) {
+            log_warning(
+                tt::LogOp,
+                "Adjusted total active senders to {} (num_blocks={}) for non-power-of-2 grid.",
+                total_senders(),
+                num_blocks);
+        }
+    }
     std::vector<CoreRange> input_all_storage_cores_range;
     input_all_storage_cores_range.reserve(input_all_storage_cores_vec.size());
     std::transform(
@@ -259,6 +320,12 @@ create_program_dram_sharded(
 
     std::set<CoreRange> input_all_storage_cores_set(
         input_all_storage_cores_range.begin(), input_all_storage_cores_range.end());
+    // Hybrid cores must appear in mcast_senders so they get TYPE 2 (sender + compute)
+    // kernel assignments. Without this they fall through to idle and never increment
+    // the sender semaphore, causing a deadlock when hybrids exist on spatial partitions.
+    for (const auto& core : storage_worker_common) {
+        input_all_storage_cores_set.insert(CoreRange(core));
+    }
     std::set<CoreRange> all_worker_cores_set(all_worker_cores_range.begin(), all_worker_cores_range.end());
     CoreRangeSet mcast_senders = CoreRangeSet(input_all_storage_cores_set);
     CoreRangeSet mcast_receivers = CoreRangeSet(all_worker_cores_set);
@@ -296,16 +363,10 @@ create_program_dram_sharded(
     uint32_t in0_num_subblocks = (per_core_M / out_subblock_h);
     uint32_t in0_block_num_tiles = out_subblock_h * in0_block_w * in0_num_subblocks;
 
-    uint32_t num_blocks_per_shard = num_blocks / input_all_storage_cores_vec.size();
+    uint32_t total_active_senders =
+        (uint32_t)(input_all_storage_cores_vec.size() + storage_worker_common.size());
+    uint32_t num_blocks_per_shard = num_blocks / total_active_senders;
     log_debug(tt::LogOp, "num_blocks_per_shard: {}", num_blocks_per_shard);
-    if (per_core_M > 1) {
-        TT_FATAL(
-            num_blocks_per_shard == 1,
-            "currently not support per_core_M larger than 1, while split one shard into multiple blocks (per_core_M "
-            "{}, num_blocks_per_shard {})",
-            per_core_M,
-            num_blocks_per_shard);
-    }
 
     std::vector<uint32_t> in0_sender_compile_time_args = {
         (std::uint32_t)in0_block_num_tiles,                         // in0_block_num_tiles
@@ -650,6 +711,11 @@ create_program_dram_sharded(
 
     std::vector<CoreCoord> mcast_receiver_coords = corerange_to_cores(mcast_receivers);
     for (auto core : mcast_receiver_coords) {
+        // Skip hybrid cores — already set as TYPE 2 in the sender loop; do not overwrite.
+        if (std::find(storage_worker_common.begin(), storage_worker_common.end(), core) !=
+            storage_worker_common.end()) {
+            continue;
+        }
         // in0 receivers rt args
         std::vector<uint32_t> mm_in0_receiver_args;
         // mcast receiver - 3

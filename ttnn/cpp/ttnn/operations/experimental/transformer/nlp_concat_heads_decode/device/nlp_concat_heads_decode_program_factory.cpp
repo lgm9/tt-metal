@@ -51,13 +51,12 @@ NLPConcatHeadsDecodeProgramFactory::cached_program_t NLPConcatHeadsDecodeProgram
 
     // cores to read and write to output
     uint32_t num_cores = q_cores.num_cores();  // number of cores of the output
-    auto core_grid = q_cores.bounding_box();
-    uint32_t num_cores_x = core_grid.end_coord.x + 1, num_cores_y = core_grid.end_coord.y + 1;
-    const auto& cores = grid_to_cores(num_cores, num_cores_x, num_cores_y, true);
+    const auto& cores = corerange_to_cores(q_cores, num_cores, true);
 
     // cores for input
     auto in_core_grid = in_cores.bounding_box();
-    uint32_t in_num_cores_x = in_core_grid.end_coord.x + 1, in_num_cores_y = in_core_grid.end_coord.y + 1;
+    uint32_t in_num_cores_x = in_core_grid.end_coord.x + 1;
+    uint32_t in_num_cores_y = in_core_grid.end_coord.y - in_core_grid.start_coord.y + 1;
 
     std::vector<uint32_t> noc_x_coords;
     noc_x_coords.reserve(in_num_cores_x);
@@ -66,7 +65,7 @@ NLPConcatHeadsDecodeProgramFactory::cached_program_t NLPConcatHeadsDecodeProgram
     }
     std::vector<uint32_t> noc_y_coords;
     noc_y_coords.reserve(in_num_cores_y);
-    for (uint32_t y = 0; y < in_num_cores_y; ++y) {
+    for (uint32_t y = in_core_grid.start_coord.y; y <= in_core_grid.end_coord.y; ++y) {
         noc_y_coords.push_back(device->worker_core_from_logical_core({0, y}).y);
     }
 

@@ -1055,7 +1055,7 @@ void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device)
 }
 
 void detail::ProgramImpl::validate_circular_buffer_core_ranges(const IDevice* device) {
-    auto grid_size = device->compute_with_storage_grid_size();
+    auto grid_size = device->logical_grid_size();
     for (const auto& cb : circular_buffers_) {
         for (const auto& cr : cb->core_ranges().ranges()) {
             TT_FATAL(
@@ -1430,12 +1430,14 @@ const std::vector<SubDeviceId>& detail::ProgramImpl::determine_sub_device_ids(co
             uint32_t num_intersections = 0;
             uint32_t num_cores = 0;
             for (const auto& kg : program_kgs) {
+                std::unordered_set<SubDeviceId> kg_sub_ids;
                 for (size_t i = 0; i < device->num_sub_devices(); ++i) {
                     const auto& sub_device_cores =
                         device->worker_cores(core_type, SubDeviceId{static_cast<unsigned char>(i)});
                     auto intersection = sub_device_cores.intersection(kg->core_ranges);
                     if (!intersection.empty()) {
                         used_sub_device_ids.insert(SubDeviceId{static_cast<unsigned char>(i)});
+                        kg_sub_ids.insert(SubDeviceId{static_cast<unsigned char>(i)});
                         num_intersections += intersection.num_cores();
                     }
                 }

@@ -12,6 +12,31 @@
 #include <tt-metalium/work_split.hpp>
 
 using namespace tt::tt_metal;
+
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
+namespace {
+CoreRangeSet partition_workers(IDevice* device) {
+    const uint32_t y = tt_get_spatial_compute_grid_y();
+    if (y == 0) {
+        return device->worker_cores(HalProgrammableCoreType::TENSIX, device->get_sub_device_ids().front());
+    }
+    const uint32_t y0 = tt_get_spatial_compute_grid_y_start();
+    for (const auto& sub_device_id : device->get_sub_device_ids()) {
+        const auto& workers = device->worker_cores(HalProgrammableCoreType::TENSIX, sub_device_id);
+        if (!workers.ranges().empty()) {
+            const auto& r = workers.ranges().front();
+            if (r.start_coord.y == y0 && r.end_coord.y == y0 + y - 1) {
+                return workers;
+            }
+        }
+    }
+    const auto g = device->compute_with_storage_grid_size();
+    return CoreRangeSet(CoreRange({0, y0}, {g.x - 1, y0 + y - 1}));
+}
+}  // namespace
+
 namespace ttnn::operations::ternary {
 
 CoreRangeSet get_worker_grid(
@@ -70,7 +95,7 @@ CoreRangeSet get_worker_grid(
         log_debug(
             tt::LogOp, "Using all worker cores of the device for worker grid, output or memory config not sharded");
         auto* device = input_tensor_a.device();
-        return device->worker_cores(HalProgrammableCoreType::TENSIX, device->get_sub_device_ids().front());
+        return partition_workers(device);
     }
 
     if (is_native_L1_sharding(
@@ -102,7 +127,7 @@ CoreRangeSet get_worker_grid(
     }
     log_debug(tt::LogOp, "Using all worker cores of the device for worker grid");
     auto* device = input_tensor_a.device();
-    return device->worker_cores(HalProgrammableCoreType::TENSIX, device->get_sub_device_ids().front());
+    return partition_workers(device);
 }
 
 static ttnn::Shape compute_broadcasted_output_binary(const ttnn::Shape& a_shape, const ttnn::Shape& b_shape) {
@@ -556,7 +581,7 @@ ttsl::hash::hash_t TernaryDeviceOperation::compute_program_hash(
             shard_volumes);
     }
 
-    return hash;
+    return ttsl::hash::hash_objects(hash, tt_get_spatial_compute_grid_y_start());
 }
 
 bool TernaryDeviceOperation::skip_launch(

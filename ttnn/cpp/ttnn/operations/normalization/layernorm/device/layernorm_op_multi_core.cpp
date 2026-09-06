@@ -2,6 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+// Thread-local spatial partition helpers (defined in mesh_device.cpp).
+extern "C" uint32_t tt_get_spatial_compute_grid_y();
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 #include <string>
 
 #include "ttnn/operations/normalization/layernorm/device/layernorm_op_multi_core.hpp"
@@ -96,6 +100,7 @@ LayerNormMultiCoreProgramFactory::cached_program_t LayerNormMultiCoreProgramFact
     auto* device = tensor_args.input.device();
     auto grid_size = device->compute_with_storage_grid_size();
     auto num_cores = program_descriptor.kernels[0].runtime_args.size();
+    uint32_t y_start = tt_get_spatial_compute_grid_y() > 0 ? tt_get_spatial_compute_grid_y_start() : 0u;
     ////////////////////////////////////////////////////////////////////////////
     //                      Create Program from Descriptor
     ////////////////////////////////////////////////////////////////////////////
@@ -111,7 +116,8 @@ LayerNormMultiCoreProgramFactory::cached_program_t LayerNormMultiCoreProgramFact
             .reader_kernel_id = reader_kernels_id,
             .writer_kernel_id = writer_kernels_id,
             .num_cores = num_cores,
-            .grid_size = grid_size}};
+            .grid_size = grid_size,
+            .core_y_start = y_start}};
 }
 
 tt::tt_metal::ProgramDescriptor LayerNormMultiCoreProgramFactory::create_descriptor(
@@ -799,7 +805,8 @@ void LayerNormMultiCoreProgramFactory::override_runtime_arguments(
     auto& program = cached_program.program;
 
     for (uint32_t i = 0; i < shared_vars.num_cores; ++i) {
-        CoreCoord core = {i % shared_vars.grid_size.x, i / shared_vars.grid_size.x};
+        CoreCoord core = {i % shared_vars.grid_size.x,
+                          shared_vars.core_y_start + i / shared_vars.grid_size.x};
 
         {
             auto& runtime_args = GetRuntimeArgs(program, shared_vars.reader_kernel_id, core);
@@ -824,6 +831,11 @@ void LayerNormMultiCoreProgramFactory::override_runtime_arguments(
 
 CoreRangeSet LayerNormMultiCoreProgramFactory::default_core_range(IDevice* device) {
     auto grid_size = device->compute_with_storage_grid_size();
+    uint32_t sp_y = tt_get_spatial_compute_grid_y();
+    if (sp_y > 0) {
+        uint32_t y0 = tt_get_spatial_compute_grid_y_start();
+        return CoreRangeSet({CoreRange({0, y0}, {grid_size.x - 1, y0 + sp_y - 1})});
+    }
     return CoreRangeSet({CoreRange({0, 0}, {grid_size.x - 1, grid_size.y - 1})});
 }
 

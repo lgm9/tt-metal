@@ -4,6 +4,7 @@
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+
 from models.common.rmsnorm import RMSNorm
 from models.tt_transformers.tt.attention import Attention as DefaultAttention
 from models.tt_transformers.tt.common import Mode
@@ -293,6 +294,11 @@ class TransformerBlock(LightweightModule):
             hidden_states = ttnn.to_memory_config(hidden_states, memory_config=self.args.get_mlp_act_mem_config(mode))
         # MLP takes replicated inputs and produces fractured outputs
 
+        # Fence: flush wo_matmul + add + ff_norm before MLP's large weight reads.
+        # Concurrent wo_matmul DRAM writes + MLP weight reads saturate the NOC
+        # on Blackhole and deadlock (observed at user_id=9, layer=18).
+        if mode == "prefill":
+            ttnn.synchronize_device(self.mesh_device)
         hidden_states = self.feed_forward.forward(hidden_states, mode)
 
         activation_dtype = self.args.decoders_optimizations.get_tensor_dtype(
@@ -318,5 +324,4 @@ class TransformerBlock(LightweightModule):
             if TG and not self.args.is_distributed_norm(mode)
             else activation_dtype or ttnn.bfloat16,
         )
-
         return out  # fractured across devices
