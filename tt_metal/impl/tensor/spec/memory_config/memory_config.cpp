@@ -8,16 +8,43 @@
 #include <tt-metalium/experimental/tensor/tensor_types.hpp>
 #include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
 
+#include "spatial_confine.hpp"
+
 namespace tt::tt_metal {
+
+namespace {
+// Spatial confinement of L1 shard grids (SwiftNPU mechanism, 09 step 1): a shard grid expressed in
+// partition-relative rows [0, y) moves to the active partition, the same rule spatial_confine.hpp applies
+// to kernels, circular buffers and semaphores.  Ops that build their output memory config from the
+// origin in C++ (matmul, nlp_*_heads_decode, rotary, binary_ng, ...) otherwise leave the bottom tenant's
+// sharded tensors in the L1 of the other tenant's rows while their kernels run inside the partition
+// (bench_09_decode_ab: first wrong op was sharded_to_interleaved of the QKV matmul output).  Grids that
+// are already absolute (Python-built configs) are unchanged.  DRAM shard grids index banks, not worker
+// rows, and are never touched.
+std::optional<ShardSpec> confine_shard_spec(std::optional<ShardSpec> spec, BufferType buffer_type) {
+    if (spec.has_value() && buffer_type != BufferType::DRAM) {
+        spec->grid = spatial_confine(spec->grid);
+    }
+    return spec;
+}
+std::optional<NdShardSpec> confine_nd_shard_spec(std::optional<NdShardSpec> spec, BufferType buffer_type) {
+    if (spec.has_value() && buffer_type != BufferType::DRAM) {
+        spec->grid = spatial_confine(spec->grid);
+    }
+    return spec;
+}
+}  // namespace
 
 MemoryConfig::MemoryConfig(
     TensorMemoryLayout memory_layout, BufferType buffer_type, std::optional<ShardSpec> shard_spec) :
-    memory_layout_(memory_layout), buffer_type_(buffer_type), shard_spec_(std::move(shard_spec)) {}
+    memory_layout_(memory_layout),
+    buffer_type_(buffer_type),
+    shard_spec_(confine_shard_spec(std::move(shard_spec), buffer_type)) {}
 
 MemoryConfig::MemoryConfig(BufferType buffer_type, std::optional<NdShardSpec> nd_shard_spec) :
     memory_layout_(nd_shard_spec.has_value() ? TensorMemoryLayout::ND_SHARDED : TensorMemoryLayout::INTERLEAVED),
     buffer_type_(buffer_type),
-    nd_shard_spec_(std::move(nd_shard_spec)),
+    nd_shard_spec_(confine_nd_shard_spec(std::move(nd_shard_spec), buffer_type)),
     created_with_nd_shard_spec_(nd_shard_spec_.has_value()) {}
 
 MemoryConfig::MemoryConfig(
@@ -28,8 +55,8 @@ MemoryConfig::MemoryConfig(
     bool created_with_nd_shard_spec) :
     memory_layout_(memory_layout),
     buffer_type_(buffer_type),
-    shard_spec_(std::move(shard_spec)),
-    nd_shard_spec_(std::move(nd_shard_spec)),
+    shard_spec_(confine_shard_spec(std::move(shard_spec), buffer_type)),
+    nd_shard_spec_(confine_nd_shard_spec(std::move(nd_shard_spec), buffer_type)),
     created_with_nd_shard_spec_(created_with_nd_shard_spec) {}
 
 MemoryConfig MemoryConfig::create_with_prepopulated_shard_specs(
