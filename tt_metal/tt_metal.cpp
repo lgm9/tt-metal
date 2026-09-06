@@ -1323,20 +1323,6 @@ inline bool spatial_shift_active(uint32_t& y0, uint32_t& y) {
     y0 = tt_get_spatial_compute_grid_y_start();
     return y0 >= y;
 }
-inline CoreCoord spatial_confine(const CoreCoord& c) {
-    uint32_t y0 = 0, y = 0;
-    if (!spatial_shift_active(y0, y) || c.y >= y) {
-        return c;
-    }
-    return CoreCoord(c.x, c.y + y0);
-}
-inline CoreRange spatial_confine(const CoreRange& r) {
-    uint32_t y0 = 0, y = 0;
-    if (!spatial_shift_active(y0, y) || r.end_coord.y >= y) {
-        return r;
-    }
-    return CoreRange(CoreCoord(r.start_coord.x, r.start_coord.y + y0), CoreCoord(r.end_coord.x, r.end_coord.y + y0));
-}
 inline CoreRangeSet spatial_confine(const CoreRangeSet& crs) {
     uint32_t y0 = 0, y = 0;
     if (!spatial_shift_active(y0, y)) {
@@ -1354,11 +1340,6 @@ inline CoreRangeSet spatial_confine(const CoreRangeSet& crs) {
             CoreCoord(r.start_coord.x, r.start_coord.y + y0), CoreCoord(r.end_coord.x, r.end_coord.y + y0));
     }
     return CoreRangeSet(std::move(shifted));
-}
-inline std::variant<CoreCoord, CoreRange, CoreRangeSet> spatial_confine(
-    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& spec) {
-    return std::visit(
-        [](const auto& s) -> std::variant<CoreCoord, CoreRange, CoreRangeSet> { return spatial_confine(s); }, spec);
 }
 }  // namespace
 
