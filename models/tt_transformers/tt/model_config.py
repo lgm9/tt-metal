@@ -714,6 +714,17 @@ class ModelArgs:
                 if self.is_galaxy
                 else self.find_prefill_grid(self.prefill_rows, self.hidden_dim // ttnn.TILE_SIZE)
             )
+            # Under a spatial partition the MLP prefill grid has fewer than 8 rows (8x4 inside a
+            # 5-row partition) while FF1/FF3 still split N over the 8 DRAM columns, so per_core_M
+            # doubles and the circular buffers overflow L1 (1.68 MB > 1.5 MB at seq_len 1024).
+            # Scale the sequence chunk with the grid rows so the per-core matmul shapes equal the
+            # full chip's: 512 rows over 8 grid rows == 256 rows over 4.
+            _mlp_prefill_rows = self.mlp1_3_grid(1024)[1]
+            if is_blackhole() and _mlp_prefill_rows < 8:
+                self.prefill_len_cutoff = max(ttnn.TILE_SIZE, (512 * _mlp_prefill_rows) // 8)
+                logger.info(
+                    f"prefill_len_cutoff -> {self.prefill_len_cutoff} for a {_mlp_prefill_rows}-row MLP prefill grid"
+                )
             self.mlp_core_grid = (
                 self.dram_shard_core_grid_for_k(self.dim)
                 if self.is_galaxy
@@ -2407,10 +2418,24 @@ class ModelArgs:
 
     @lru_cache(maxsize=None)
     def get_attn_kv_prefill_mem_config(self, seq_len: int = 1):
-        """Get the memory config for KV cache fill during prefill."""
+        """Get the memory config for KV cache fill during prefill.
+
+        The grid is clamped to the spatial partition by spatial_core's CoreGrid patch
+        (64 cores on the full chip, 40 in a 5-row partition), so the shard height must
+        be derived from the grid actually returned: dividing by a hard-coded 64 put 64
+        height-shards on 40 cores (TT_FATAL num_shards <= num_cores).  Tile-aligned;
+        unchanged on the full chip (8192 / 64 = 128 for seq_len 1024).
+        """
+        grid = ttnn.CoreGrid(y=8, x=8)
+        rows = (self.n_kv_heads // self.cluster_shape[1]) * seq_len
+        min_h = math.ceil(rows / grid.num_cores / ttnn.TILE_SIZE) * ttnn.TILE_SIZE
+        # update_cache additionally requires seq_len % shard_height == 0: take the smallest
+        # tile-multiple divisor of seq_len that still keeps num_shards <= num_cores
+        # (256 for seq_len 1024 on 40 cores; 128 on 64 cores, as before).
+        shard_h = next((h for h in range(min_h, seq_len + 1, ttnn.TILE_SIZE) if seq_len % h == 0), seq_len)
         return ttnn.create_sharded_memory_config(
-            (((self.n_kv_heads // self.cluster_shape[1]) * seq_len // (8 * 8)), self.head_dim),
-            ttnn.CoreGrid(y=8, x=8),
+            (shard_h, self.head_dim),
+            grid,
             ttnn.ShardStrategy.HEIGHT,
             ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,

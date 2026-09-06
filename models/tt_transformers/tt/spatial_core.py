@@ -317,6 +317,35 @@ def install_patches() -> None:
 
             ttnn.CoreRangeSet = _SpatialCoreRangeSet
 
+    # ── MinimalMatmulConfig (experimental; prefill QKV and large-seq matmuls) ──
+    # Its nanobind __init__ requires a real ttnn.CoreCoord for
+    # compute_with_storage_grid_size and rejects the _SpatialCoreCoord wrapper
+    # ("TypeError: incompatible function arguments"), which made every prefill
+    # with seq_len > 128 fail under install_patches().  model_config also asks
+    # for the full 8x10 Blackhole grid here, so clamp the height to the partition.
+    # NOTE: minimal_matmul_program_factory.cpp does not read
+    # tt_get_spatial_compute_grid_y_start(), so the op always lands on rows
+    # 0..y-1.  That is correct only for the top partition (y_offset == 0);
+    # making it partition-aware is a C++ change (rebuild).
+    if hasattr(ttnn, "MinimalMatmulConfig"):
+        _orig_MinimalMatmulConfig = ttnn.MinimalMatmulConfig
+
+        def _spatial_minimal_matmul_config(*args, **kwargs):
+            g = kwargs.get("compute_with_storage_grid_size")
+            if g is not None:
+                if isinstance(g, (tuple, list)):
+                    gx, gy = int(g[0]), int(g[1])
+                elif isinstance(g, _SpatialCoreCoord):
+                    gx, gy = int(g.x) - _x_offset(), int(g.y) - _y_offset()   # undo the wrapper's shift
+                else:
+                    gx, gy = int(g.x), int(g.y)
+                gx = max(1, min(gx, min(_max_x(), 8)))
+                gy = max(1, min(gy, _max_y()))
+                kwargs["compute_with_storage_grid_size"] = _orig_CoreCoord(gx, gy)
+            return _orig_MinimalMatmulConfig(*args, **kwargs)
+
+        ttnn.MinimalMatmulConfig = _spatial_minimal_matmul_config
+
     # ── compute_with_storage_grid_size tuple form ──────────────────────────────
     # Some ops receive compute_with_storage_grid_size as a plain (x, y) tuple.
     # We can't patch that generically here, but SpatialDevice already returns
