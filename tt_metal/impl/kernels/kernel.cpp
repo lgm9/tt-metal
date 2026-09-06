@@ -398,7 +398,7 @@ uint64_t Kernel::compute_hash() const {
 }
 
 std::vector<uint32_t>& Kernel::runtime_args(const CoreCoord& requested_core) {
-    const CoreCoord logical_core = this->spatial_abs(requested_core);
+    const CoreCoord logical_core = this->spatial_rel(requested_core);  // storage slot (see spatial_rel)
     // TODO (abhullar): Should this check only be enabled in debug mode?
     TT_FATAL(
         logical_core.x < this->core_to_runtime_args_.size() &&
@@ -410,7 +410,7 @@ std::vector<uint32_t>& Kernel::runtime_args(const CoreCoord& requested_core) {
 }
 
 RuntimeArgsData& Kernel::runtime_args_data(const CoreCoord& requested_core) {
-    const CoreCoord logical_core = this->spatial_abs(requested_core);
+    const CoreCoord logical_core = this->spatial_rel(requested_core);  // storage slot (see spatial_rel)
     // TODO (abhullar): Should this check only be enabled in debug mode?
     TT_FATAL(
         logical_core.x < this->core_to_runtime_args_.size() &&
@@ -457,13 +457,14 @@ void Kernel::validate_runtime_args_size(
 }
 
 void Kernel::set_runtime_args(const CoreCoord& requested_core, stl::Span<const uint32_t> runtime_args) {
-    // Spatial confinement: a partition-relative core maps onto the absolute core dispatch runs.
-    const CoreCoord logical_core = this->spatial_abs(requested_core);
+    // Spatial confinement: runtime args live at the partition-relative slot (spatial_rel), whichever
+    // coordinate the caller used; is_on_logical_core accepts both forms.
+    const CoreCoord logical_core = this->spatial_rel(requested_core);
     // TODO (abhullar): If we don't include this check then user can write runtime args to a core that the kernel is not
     // placed on.
     //                  Should this check only be enabled in debug mode?
     TT_ASSERT(
-        this->is_on_logical_core(logical_core),
+        this->is_on_logical_core(requested_core),
         "Cannot set runtime args for core {} since kernel {} is not placed on it. core range set: {}!",
         logical_core.str(),
         this->name(),
@@ -500,12 +501,6 @@ void Kernel::set_runtime_args(const CoreCoord& requested_core, stl::Span<const u
         this->core_to_runtime_args_data_[logical_core.x][logical_core.y] = RuntimeArgsData{
             set_rt_args.data() + watcher_count_word_offset_, set_rt_args.size() - watcher_count_word_offset_};
         this->core_with_runtime_args_.insert(logical_core);
-        if (!(logical_core == requested_core)) {
-            // The factory addresses this core by its partition-relative coordinate, including through
-            // the 2-D runtime_args_data() view on cache hits: alias that slot to the same storage.
-            this->core_to_runtime_args_data_[requested_core.x][requested_core.y] =
-                this->core_to_runtime_args_data_[logical_core.x][logical_core.y];
-        }
     } else {
         // Updating existing args - extract user arg count and verify it matches
         size_t user_arg_count = set_rt_args.size() - watcher_count_word_offset_;
@@ -551,13 +546,14 @@ void Kernel::set_runtime_args_count(CoreRangeSet& core_ranges, uint32_t count) {
     for (const CoreRange& core_range : core_ranges.ranges()) {
         for (auto x = core_range.start_coord.x; x <= core_range.end_coord.x; x++) {
             for (auto y = core_range.start_coord.y; y <= core_range.end_coord.y; y++) {
-                auto& set_rt_args = this->core_to_runtime_args_[x][y];
+                const CoreCoord slot = this->spatial_rel(CoreCoord(x, y));  // absolute core -> storage slot
+                auto& set_rt_args = this->core_to_runtime_args_[slot.x][slot.y];
                 if (set_rt_args.empty()) {
                     continue;
                 }
 
-                TT_ASSERT(count >= core_to_runtime_args_data_[x][y].size());
-                core_to_runtime_args_data_[x][y].rt_args_count = count - watcher_count_word_offset_;
+                TT_ASSERT(count >= core_to_runtime_args_data_[slot.x][slot.y].size());
+                core_to_runtime_args_data_[slot.x][slot.y].rt_args_count = count - watcher_count_word_offset_;
             }
         }
     }

@@ -139,6 +139,16 @@ public:
     CoreCoord spatial_abs(const CoreCoord& c) const {
         return (spatial_row_shift_ != 0 && c.y < spatial_height_) ? CoreCoord(c.x, c.y + spatial_row_shift_) : c;
     }
+    // Inverse: the absolute core dispatch iterates -> the relative slot the factory addresses.  Runtime
+    // args are stored at the relative slot so the factory's 2-D runtime_args_data() view and dispatch's
+    // per-core accessors reach one RuntimeArgsData (dispatch redirects its pointer into the command
+    // sequence once; an aliased copy would keep pointing at the stale vector).  Relative rows are
+    // < height <= shift, so they are never mistaken for absolute ones.
+    CoreCoord spatial_rel(const CoreCoord& c) const {
+        return (spatial_row_shift_ != 0 && c.y >= spatial_row_shift_ && c.y < spatial_row_shift_ + spatial_height_)
+                   ? CoreCoord(c.x, c.y - spatial_row_shift_)
+                   : c;
+    }
 
     const std::map<std::string, std::string>& defines() const { return defines_; }
 

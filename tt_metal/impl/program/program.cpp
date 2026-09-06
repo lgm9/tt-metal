@@ -43,6 +43,7 @@
 #include "impl/buffers/circular_buffer.hpp"
 #include "circular_buffer_constants.h"
 #include "core_coord.hpp"
+#include "spatial_confine.hpp"
 #include "common/stable_hash.hpp"
 #include "impl/context/metal_context.hpp"
 #include "impl/context/context_types.hpp"
@@ -229,13 +230,18 @@ Program::Program(const ProgramDescriptor& descriptor) : internal_(std::make_shar
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureProgramConstructor, *this);
 
+    // Spatial confinement: this path bypasses CreateCircularBuffer / CreateSemaphore, so apply the same
+    // partition shift here; the kernels below go through CreateKernel and are shifted there.
     for (const auto& cb_descriptor : descriptor.cbs) {
-        internal_->add_circular_buffer_(std::make_shared<CircularBufferImpl>(cb_descriptor));
+        CBDescriptor confined = cb_descriptor;
+        confined.core_ranges = spatial_confine(cb_descriptor.core_ranges);
+        internal_->add_circular_buffer_(std::make_shared<CircularBufferImpl>(confined));
     }
 
     for (const auto& semaphore_descriptor : descriptor.semaphores) {
         internal_->add_semaphore(
-            semaphore_descriptor.core_ranges,
+            semaphore_descriptor.core_type == CoreType::WORKER ? spatial_confine(semaphore_descriptor.core_ranges)
+                                                               : semaphore_descriptor.core_ranges,
             semaphore_descriptor.id,
             semaphore_descriptor.initial_value,
             semaphore_descriptor.core_type);
