@@ -19,6 +19,9 @@ using namespace tt;
 using namespace tt::constants;
 using namespace tt::tt_metal;
 
+// Spatial partition (SwiftNPU mechanism): first compute row of the active partition, 0 when none.
+extern "C" uint32_t tt_get_spatial_compute_grid_y_start();
+
 namespace ttnn::prim {
 
 SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
@@ -135,6 +138,7 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
     CoreCoord grid_size = program_config.has_value() ? program_config->compute_with_storage_grid_size
                                                      : device->compute_with_storage_grid_size();
     const uint32_t num_cores_available = grid_size.x * grid_size.y;
+    const uint32_t grid_y0 = tt_get_spatial_compute_grid_y_start();  // spatial partition row offset
     const uint32_t num_cores_in_grid =
         device->compute_with_storage_grid_size().x * device->compute_with_storage_grid_size().y;
 
@@ -149,7 +153,9 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
             num_cores_available);
         on_subcoregrid = true;
     } else {
-        core_grid = CoreRangeSet(std::vector{CoreRange({0, 0}, {grid_size.x - 1, grid_size.y - 1})});
+        // Anchor the worker grid at the partition's first row so the K-multicast targets computed from
+        // these logical cores (worker_core_from_logical_core below) land inside the partition.
+        core_grid = CoreRangeSet(std::vector{CoreRange({0, grid_y0}, {grid_size.x - 1, grid_y0 + grid_size.y - 1})});
     }
 
     TT_FATAL(
@@ -270,10 +276,10 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
         for (uint32_t i = 0; i < num_cores_available; ++i) {
             CoreCoord core;
             if ((i % num_cores_per_batch == 0) && (reducer_idx < num_output_cores)) {
-                core = {reducer_idx % grid_size.x, reducer_idx / grid_size.x};
+                core = {reducer_idx % grid_size.x, grid_y0 + reducer_idx / grid_size.x};
                 reducer_idx++;
             } else {
-                core = {worker_idx % grid_size.x, worker_idx / grid_size.x};
+                core = {worker_idx % grid_size.x, grid_y0 + worker_idx / grid_size.x};
                 worker_idx++;
             }
             (i < num_active_cores ? core_group : core_group_idle).push_back(core);
@@ -281,7 +287,7 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
     } else {
         // Q in DRAM, no sharding: simple linear assignment
         for (uint32_t i = 0; i < num_cores_available; ++i) {
-            CoreCoord core = {i % grid_size.x, i / grid_size.x};
+            CoreCoord core = {i % grid_size.x, grid_y0 + i / grid_size.x};
             (i < num_active_cores ? core_group : core_group_idle).push_back(core);
         }
     }
@@ -777,7 +783,7 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
             core_num_in_reduce =
                 i % num_cores_per_head;               // position within the reduction group (0 to num_cores_per_head-1)
             core_num_in_output = core_num_in_reduce;  // same as reduce for single head
-            do_k_mcast = (core.y % q_heads_parallel_factor == 0);
+            do_k_mcast = ((core.y - tt_get_spatial_compute_grid_y_start()) % q_heads_parallel_factor == 0);  // row inside the grid
             num_dests = q_heads_parallel_factor - 1;
             if (do_k_mcast && num_dests > 0) {
                 auto phys_start = device->worker_core_from_logical_core(CoreCoord{core.x, core.y + 1});
@@ -1057,7 +1063,7 @@ void SdpaDecodeProgramFactory::override_runtime_arguments(
             cur_head = 0;                                         // single KV head when using this indexing
             core_num_in_reduce = i % num_cores_per_head;          // position within the reduction group
             core_num_in_output = core_num_in_reduce;              // same as reduce for single head
-            do_k_mcast = (core.y % q_heads_parallel_factor == 0);
+            do_k_mcast = ((core.y - tt_get_spatial_compute_grid_y_start()) % q_heads_parallel_factor == 0);  // row inside the grid
             num_dests = q_heads_parallel_factor - 1;
             if (do_k_mcast && num_dests > 0) {
                 auto phys_start = dev->worker_core_from_logical_core(CoreCoord{core.x, core.y + 1});
