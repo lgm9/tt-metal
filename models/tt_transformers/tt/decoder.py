@@ -2,7 +2,10 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import ttnn
+
+_PREFILL_FENCE = os.environ.get("ATTN_PREFILL_FENCE", "1") == "1"   # see attention.py
 from models.common.lightweightmodule import LightweightModule
 
 from models.common.rmsnorm import RMSNorm
@@ -297,7 +300,7 @@ class TransformerBlock(LightweightModule):
         # Fence: flush wo_matmul + add + ff_norm before MLP's large weight reads.
         # Concurrent wo_matmul DRAM writes + MLP weight reads saturate the NOC
         # on Blackhole and deadlock (observed at user_id=9, layer=18).
-        if mode == "prefill":
+        if mode == "prefill" and _PREFILL_FENCE:  # host fence; ATTN_PREFILL_FENCE=0 drops it (trace capture)
             ttnn.synchronize_device(self.mesh_device)
         hidden_states = self.feed_forward.forward(hidden_states, mode)
 
