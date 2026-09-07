@@ -73,6 +73,20 @@ struct SpatialGridOverride {
     bool valid = false;
 };
 thread_local SpatialGridOverride tl_spatial_grid;
+
+// Sub-device bookkeeping must see the physical worker grid, not the partition's 8-column override:
+// SubDeviceManager derives the set of cores outside every sub-device from compute_with_storage_grid_size()
+// (go-message mapping, RUN_MSG_DONE reset, grid validation).  With the override active during
+// create/load, the 50 worker cores in columns 8-12 kept the default manager's mapping (index 0), acked
+// every sub-device-0 go signal, and sub-device 0's completion count ran ahead: syncs returned early,
+// traces "completed" in 2.2 ms, un-traced sequences hung (08 steps 1/3, 09 Path A).
+struct SpatialGridOverrideSuspend {
+    SpatialGridOverride saved = tl_spatial_grid;
+    SpatialGridOverrideSuspend() { tl_spatial_grid.valid = false; }
+    ~SpatialGridOverrideSuspend() { tl_spatial_grid = saved; }
+    SpatialGridOverrideSuspend(const SpatialGridOverrideSuspend&) = delete;
+    SpatialGridOverrideSuspend& operator=(const SpatialGridOverrideSuspend&) = delete;
+};
 }  // namespace
 
 extern "C" {
@@ -1052,6 +1066,7 @@ void MeshDeviceImpl::validate_sub_device_manager_tracker() const {
 SubDeviceManagerId MeshDeviceImpl::create_sub_device_manager(
     std::initializer_list<SubDevice> sub_devices, DeviceAddr local_l1_size) {
     auto lock = lock_api();
+    SpatialGridOverrideSuspend physical_grid;  // see SpatialGridOverrideSuspend
     validate_sub_device_manager_tracker();
     return sub_device_manager_tracker_->create_sub_device_manager(sub_devices, local_l1_size);
 }
@@ -1059,6 +1074,7 @@ SubDeviceManagerId MeshDeviceImpl::create_sub_device_manager(
 SubDeviceManagerId MeshDeviceImpl::create_sub_device_manager(
     tt::stl::Span<const SubDevice> sub_devices, DeviceAddr local_l1_size) {
     auto lock = lock_api();
+    SpatialGridOverrideSuspend physical_grid;  // see SpatialGridOverrideSuspend
     validate_sub_device_manager_tracker();
     return sub_device_manager_tracker_->create_sub_device_manager(sub_devices, local_l1_size);
 }
@@ -1069,6 +1085,7 @@ void MeshDeviceImpl::remove_sub_device_manager(SubDeviceManagerId sub_device_man
 }
 void MeshDeviceImpl::load_sub_device_manager(SubDeviceManagerId sub_device_manager_id) {
     auto lock = lock_api();
+    SpatialGridOverrideSuspend physical_grid;  // go-message mapping and RUN_MSG_DONE reset cover all 130 cores
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->load_sub_device_manager(sub_device_manager_id);
 }
