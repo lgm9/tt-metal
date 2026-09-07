@@ -10,6 +10,11 @@ import threading
 import torch
 
 import ttnn
+
+# The five host fences in forward_prefill were added in Aug 2026 against a NoC deadlock seen only under a
+# sub-device manager; that hang was the manager's go-message mapping (fixed in tt-metal fd5320ea8e).  They
+# cannot be captured in a trace, so the traced prefill harness sets ATTN_PREFILL_FENCE=0.
+_PREFILL_FENCE = os.environ.get("ATTN_PREFILL_FENCE", "1") == "1"
 from models.common.lightweightmodule import LightweightModule
 
 # Fine-grained per-op sync for debugging decode hangs
@@ -988,7 +993,8 @@ class Attention(LightweightModule):
         # Fence: qkv_matmul reads 25 MB wqkv weight — flush before nlp_create
         # reads from xqkv_fused, otherwise the combined DRAM traffic can deadlock
         # the NOC on Blackhole (observed at user_id=9, layer=18).
-        ttnn.synchronize_device(self.mesh_device)
+        if _PREFILL_FENCE:  # host fence; ATTN_PREFILL_FENCE=0 drops it (required for prefill trace capture)
+            ttnn.synchronize_device(self.mesh_device)
 
         # FIXME: surely ttnn.linear bias should work?
         if self.wqkv_bias_prefill is not None:
@@ -1081,7 +1087,8 @@ class Attention(LightweightModule):
         # Fence: flush all in-flight ops (typecast, rotary, etc.) before fill_cache
         # issues its DRAM writes. Concurrent DRAM traffic from preceding unary ops
         # causes a NOC-level deadlock on Blackhole (observed at user_id=9, layer=18).
-        ttnn.synchronize_device(self.mesh_device)
+        if _PREFILL_FENCE:  # host fence; ATTN_PREFILL_FENCE=0 drops it (required for prefill trace capture)
+            ttnn.synchronize_device(self.mesh_device)
 
         if batch_size > 1:
             # For batched prefill, loop over VALID users only and fill each user's cache separately
@@ -1132,7 +1139,8 @@ class Attention(LightweightModule):
             )
         # Fence: ensure fill_cache DRAM writes are committed before subsequent
         # ops (typecast_Q, SDPA) run concurrently and generate competing NOC traffic.
-        ttnn.synchronize_device(self.mesh_device)
+        if _PREFILL_FENCE:  # host fence; ATTN_PREFILL_FENCE=0 drops it (required for prefill trace capture)
+            ttnn.synchronize_device(self.mesh_device)
         if seq_len >= self.min_kv_prefill_shard_seqlen and not self.TG and not page_table:
             ttnn.deallocate(k_fill)
             ttnn.deallocate(v_fill)
@@ -1220,7 +1228,8 @@ class Attention(LightweightModule):
         # Fence: ensure SDPA + nlp_concat_heads complete before wo_matmul reads its
         # input. Concurrent SDPA reads + wo_matmul weight reads can saturate the NOC
         # on Blackhole and deadlock (observed at user_id=9, layer=18).
-        ttnn.synchronize_device(self.mesh_device)
+        if _PREFILL_FENCE:  # host fence; ATTN_PREFILL_FENCE=0 drops it (required for prefill trace capture)
+            ttnn.synchronize_device(self.mesh_device)
         output_11SH = ttnn.linear(
             attn_output_11SH,
             self.wo,
@@ -1249,7 +1258,8 @@ class Attention(LightweightModule):
         # Fence: ensure wo_matmul (16 MB W_out read) completes before returning.
         # Without this, decoder.py dispatches add/ff_norm/MLP concurrently with
         # the in-flight wo_matmul, saturating the NOC on Blackhole.
-        ttnn.synchronize_device(self.mesh_device)
+        if _PREFILL_FENCE:  # host fence; ATTN_PREFILL_FENCE=0 drops it (required for prefill trace capture)
+            ttnn.synchronize_device(self.mesh_device)
         return output_11SH
 
     def forward(
