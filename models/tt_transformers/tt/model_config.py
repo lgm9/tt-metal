@@ -3713,6 +3713,11 @@ class ModelArgs:
             "per_core_N arithmetic overflow — should not happen"
         )
         in0_block_w = self.find_largest_divisor(per_core_k_tiles)
+        # Bank dial: with the weights on a bank subset each DRAM shard is 8/bank_count times wider and the reader's
+        # in1 block grows with it; shrink the K block by the same factor to keep the circular buffers in L1.
+        _bank_count = getattr(self, "dram_bank_count", 8)
+        if _bank_count < 8:
+            in0_block_w = self.find_largest_divisor(per_core_k_tiles, max_divisor=max(1, in0_block_w * _bank_count // 8))
         return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
             in0_block_w=in0_block_w,
             per_core_M=per_core_M,
