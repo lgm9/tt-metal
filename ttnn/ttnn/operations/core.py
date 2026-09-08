@@ -658,7 +658,13 @@ def as_tensor(
         return from_torch_and_dump(tensor, dtype, layout, cache_file_name, mesh_mapper)
 
     try:
-        tensor = ttnn._ttnn.tensor.load_tensor_flatbuffer(cache_file_name, device=device)
+        if device is not None and memory_config is not None and os.environ.get("SPATIAL_DRAM_BANKS"):
+            # SwiftNPU bank dial: the cached spec carries the shard grid the cache was written with (all DRAM
+            # banks); load on host and place with the memory config requested now, as a cache miss would.
+            tensor = ttnn._ttnn.tensor.load_tensor_flatbuffer(cache_file_name, device=None)
+            tensor = tensor.to(device, memory_config)
+        else:
+            tensor = ttnn._ttnn.tensor.load_tensor_flatbuffer(cache_file_name, device=device)
         logger.debug(f"Loaded cache for {cache_file_name} of shape {tensor.shape}")
     except RuntimeError as e:
         logger.warning(f"Failed to load cache for {cache_file_name}: {e}")
