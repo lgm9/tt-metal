@@ -663,6 +663,17 @@ class ModelArgs:
 
             # Using dram_shard_grid_width to ensure per_core_N matches DRAM shard width for P100, otherwise matmuls silently give bad PCC
             self.dram_shard_grid_width = 8 if is_wormhole_b0() else self.dram_grid_size.x  # 7 for P100, 8 for P150
+            # SwiftNPU bank dial (10 step 4): SPATIAL_DRAM_BANKS="start:count" places this instance's DRAM-sharded
+            # weights over DRAM cores [start, start+count) instead of all banks.  The bank-table remap cannot move
+            # weights the model already spread across all eight; this does it at load.  Read at construction, so set
+            # the variable before creating each tenant's ModelArgs.
+            _bank_env = os.environ.get("SPATIAL_DRAM_BANKS", "")
+            self.dram_bank_start, self.dram_bank_count = 0, self.dram_grid_size.x
+            if _bank_env:
+                _b0, _bn = (int(v) for v in _bank_env.split(":"))
+                assert 0 <= _b0 and _b0 + _bn <= self.dram_grid_size.x, f"SPATIAL_DRAM_BANKS {_bank_env} outside {self.dram_grid_size.x} banks"
+                self.dram_bank_start, self.dram_bank_count = _b0, _bn
+                self.dram_shard_grid_width = _bn
             # SwiftNPU spatial partitioning: row offset for half-chip instances.
             self.y_offset = y_offset if y_offset is not None else getattr(device, 'y_offset', 0)
 
@@ -675,8 +686,8 @@ class ModelArgs:
             self.dram_weight_grid = ttnn.CoreRangeSet(
                 {
                     ttnn.CoreRange(
-                        ttnn.CoreCoord(0, 0),
-                        ttnn.CoreCoord(self.dram_grid_size.x - 1, self.dram_grid_size.y - 1),
+                        ttnn.CoreCoord(self.dram_bank_start, 0),
+                        ttnn.CoreCoord(self.dram_bank_start + self.dram_bank_count - 1, self.dram_grid_size.y - 1),
                     )
                 }
             )
@@ -817,7 +828,7 @@ class ModelArgs:
             # Note: for some models (e.g. Mistral-Small) n_heads * head_dim != dim
             # For batch > 32 (per_core_M > 1) use num_dram_banks cores so num_blocks_per_shard == 1.
             _attn_out_num_cores = (
-                self.dram_grid_size.x
+                self.dram_bank_count
                 if self.tile_padded_batch_rows > self.tile_size
                 else self.n_heads // self.num_devices
             )
@@ -1031,7 +1042,7 @@ class ModelArgs:
             # For batch > 32 (per_core_M > 1), use num_dram_banks worker cores so
             # num_blocks_per_shard == 1 in the DRAM-sharded matmul factory.
             _large_batch = self.tile_padded_batch_rows > self.tile_size
-            _num_dram_banks = self.dram_grid_size.x  # 8 for Blackhole P150
+            _num_dram_banks = self.dram_bank_count  # 8 for Blackhole P150, fewer under SPATIAL_DRAM_BANKS
 
             # MLP configs
             mlp_core_grid = (
@@ -3481,7 +3492,7 @@ class ModelArgs:
         assert self.dram_grid_size.y == 1, "Current dram sharding assumes y dim is 1"
         if dram_grid is None:
             dram_grid = self.dram_weight_grid
-            dram_cores = self.dram_grid_size.x  # WH has 12 dram cores, P150 has 8, P100 has 7
+            dram_cores = self.dram_bank_count  # WH has 12 dram cores, P150 has 8, P100 has 7; bank dial: the subset
         else:
             dram_cores = dram_grid.num_cores()
         padded_size = math.ceil(n / (ttnn.TILE_SIZE * dram_cores)) * (ttnn.TILE_SIZE * dram_cores)
