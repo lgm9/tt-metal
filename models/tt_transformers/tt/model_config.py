@@ -3526,6 +3526,13 @@ class ModelArgs:
                 k % (ttnn.TILE_SIZE * grid_size[1]) == 0
             ), f"Input width must be divisible by tile size times grid size"
             in0_block_w = self.find_largest_divisor(k // (ttnn.TILE_SIZE * grid_size[1]))
+            # Bank dial (SPATIAL_DRAM_BANKS): the prefill configs set per_core_N from the DRAM shard width, which
+            # grows 8/bank_count-fold with fewer banks; shrink the K block by the same factor so the in1 circular
+            # buffer keeps its size (with 4 banks the FF1 CBs grew to 2.3 MB against 1.5 MB of L1).
+            _bank_count = getattr(self, "dram_bank_count", 8)
+            if _bank_count < 8:
+                in0_block_w = self.find_largest_divisor(
+                    k // (ttnn.TILE_SIZE * grid_size[1]), max_divisor=max(1, in0_block_w * _bank_count // 8))
 
         return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=grid_size,
