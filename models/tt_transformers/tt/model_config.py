@@ -6,6 +6,9 @@ import inspect
 import json
 import math
 import os
+
+# SPATIAL_BANK_KBLOCK=0 disables the 10 K-block scaling for DRAM bank subsets (11 step 1 isolation)
+_BANK_KBLOCK_SCALING = os.environ.get("SPATIAL_BANK_KBLOCK", "1") == "1"
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -3533,10 +3536,7 @@ class ModelArgs:
             # Bank dial (SPATIAL_DRAM_BANKS): the prefill configs set per_core_N from the DRAM shard width, which
             # grows 8/bank_count-fold with fewer banks; shrink the K block by the same factor so the in1 circular
             # buffer keeps its size (with 4 banks the FF1 CBs grew to 2.3 MB against 1.5 MB of L1).
-            _bank_count = getattr(self, "dram_bank_count", 8)
-            if _bank_count < 8:
-                in0_block_w = self.find_largest_divisor(
-                    k // (ttnn.TILE_SIZE * grid_size[1]), max_divisor=max(1, in0_block_w * _bank_count // 8))
+            in0_block_w = self._bank_subset_in0_block_w(in0_block_w, k // (ttnn.TILE_SIZE * grid_size[1]), n)
 
         return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=grid_size,
@@ -3697,6 +3697,22 @@ class ModelArgs:
                 return i
         return 1  # Fallback to 1 if no divisor found
 
+    def _bank_subset_in0_block_w(self, in0_block_w, per_core_k_tiles, n, dtype_bytes_per_tile=1088, budget_bytes=800_000):
+        """Bank dial: with the weights on `dram_bank_count` of the 8 banks the DRAM-sharded factory computes
+        per_core_N = ceil(N_tiles / bank_count) itself (num_dram_banks = its reader count), so the triple-buffered
+        in1 circular buffer grows by 8/bank_count and overflows L1.  Pick the largest divisor of per_core_k_tiles
+        whose in1 CB fits the budget.  bench_11_dramshard_minimal.py verified the factory is numerically correct
+        for 4- and 2-bank subsets at the block widths this rule selects (PCC 0.9999); 10's blanket halving was not
+        the same rule and produced wrong results on the model."""
+        banks = getattr(self, "dram_bank_count", 8)
+        if banks >= 8 or not _BANK_KBLOCK_SCALING:
+            return in0_block_w
+        per_core_N_factory = math.ceil(n / (ttnn.TILE_SIZE * banks))
+        for d in range(in0_block_w, 0, -1):
+            if per_core_k_tiles % d == 0 and 3 * per_core_N_factory * d * dtype_bytes_per_tile <= budget_bytes:
+                return d
+        return 1
+
     def dram_matmul_config(self, m: int, k: int, n: int, num_cores=None, fused_activation=None):
         # in0_block_w must evenly divide k and be no larger than tile_size * num_cores.
         # Ceiling arithmetic allows non-power-of-2 grids (e.g. 5×8, 6×8).
@@ -3715,9 +3731,7 @@ class ModelArgs:
         in0_block_w = self.find_largest_divisor(per_core_k_tiles)
         # Bank dial: with the weights on a bank subset each DRAM shard is 8/bank_count times wider and the reader's
         # in1 block grows with it; shrink the K block by the same factor to keep the circular buffers in L1.
-        _bank_count = getattr(self, "dram_bank_count", 8)
-        if _bank_count < 8:
-            in0_block_w = self.find_largest_divisor(per_core_k_tiles, max_divisor=max(1, in0_block_w * _bank_count // 8))
+        in0_block_w = self._bank_subset_in0_block_w(in0_block_w, per_core_k_tiles, n)
         return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
             in0_block_w=in0_block_w,
             per_core_M=per_core_M,
