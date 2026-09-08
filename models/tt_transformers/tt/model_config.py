@@ -676,7 +676,10 @@ class ModelArgs:
                 _b0, _bn = (int(v) for v in _bank_env.split(":"))
                 assert 0 <= _b0 and _b0 + _bn <= self.dram_grid_size.x, f"SPATIAL_DRAM_BANKS {_bank_env} outside {self.dram_grid_size.x} banks"
                 self.dram_bank_start, self.dram_bank_count = _b0, _bn
-                self.dram_shard_grid_width = _bn
+                # NOT dram_shard_grid_width: that sets per_core_N for the compute-grid (non-DRAM-sharded) prefill
+                # matmuls and the activation shard widths, which have nothing to do with where the weights live.
+                # Changing it made the model numerically wrong on 4 banks while the factory itself was correct
+                # (bench_11_dramshard_minimal.py, PCC 0.9999).
             # SwiftNPU spatial partitioning: row offset for half-chip instances.
             self.y_offset = y_offset if y_offset is not None else getattr(device, 'y_offset', 0)
 
@@ -835,7 +838,7 @@ class ModelArgs:
             # Note: for some models (e.g. Mistral-Small) n_heads * head_dim != dim
             # For batch > 32 (per_core_M > 1) use num_dram_banks cores so num_blocks_per_shard == 1.
             _attn_out_num_cores = (
-                self.dram_bank_count
+                self.dram_grid_size.x
                 if self.tile_padded_batch_rows > self.tile_size
                 else self.n_heads // self.num_devices
             )
@@ -1049,7 +1052,7 @@ class ModelArgs:
             # For batch > 32 (per_core_M > 1), use num_dram_banks worker cores so
             # num_blocks_per_shard == 1 in the DRAM-sharded matmul factory.
             _large_batch = self.tile_padded_batch_rows > self.tile_size
-            _num_dram_banks = self.dram_bank_count  # 8 for Blackhole P150, fewer under SPATIAL_DRAM_BANKS
+            _num_dram_banks = self.dram_grid_size.x  # activation shardings follow the physical bank count, not the weight subset
 
             # MLP configs
             mlp_core_grid = (
