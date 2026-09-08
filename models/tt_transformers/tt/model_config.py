@@ -683,11 +683,15 @@ class ModelArgs:
             # DRAM weight grid specs for dram sharding matmuls
             grid = device.compute_with_storage_grid_size()
             self.max_grid_size = ttnn.CoreGrid(x=grid.x, y=grid.y)
+            # DRAM cores are addressed in the 8x1 DRAM grid: build with the raw binding so the spatial CoreCoord patch
+            # (which shifts y by the partition offset) cannot move a bank grid onto row y_offset.  Cached weights
+            # bypassed this config before, which hid the shift; SPATIAL_DRAM_BANKS placement applies it.
+            _raw_cc = ttnn._ttnn.tensor.CoreCoord
             self.dram_weight_grid = ttnn.CoreRangeSet(
                 {
                     ttnn.CoreRange(
-                        ttnn.CoreCoord(self.dram_bank_start, 0),
-                        ttnn.CoreCoord(self.dram_bank_start + self.dram_bank_count - 1, self.dram_grid_size.y - 1),
+                        _raw_cc(self.dram_bank_start, 0),
+                        _raw_cc(self.dram_bank_start + self.dram_bank_count - 1, self.dram_grid_size.y - 1),
                     )
                 }
             )
