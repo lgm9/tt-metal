@@ -9,6 +9,7 @@ import os
 
 # SPATIAL_BANK_KBLOCK=0 disables the 10 K-block scaling for DRAM bank subsets (11 step 1 isolation)
 _BANK_KBLOCK_SCALING = os.environ.get("SPATIAL_BANK_KBLOCK", "1") == "1"
+_DRAM_MM_TRACE = os.environ.get("DRAM_MM_TRACE", "0") == "1"   # 17 step 1: which config blocks the full grid
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -2269,11 +2270,16 @@ class ModelArgs:
             if self.is_galaxy:
                 return None
             else:
+                # attention.forward_decode reshards attn_output to SHARDED_ATTN_INPUT_MEMCFG before this matmul,
+                # so the config must be sized by that grid and not by the head count.  They coincide on a 5-row
+                # partition (both 32 cores) and diverge on the full grid, where attn_input_grid is 64 and a
+                # head-count config asks for in0_block_w=4 against a 2-tile shard -- the assert that blocked
+                # full-grid decode (matmul_device_operation.cpp:690).
                 return self.dram_matmul_config(
                     m=self.tile_padded_batch_rows,
                     k=(self.n_heads * self.head_dim) // self.num_devices,
                     n=self.dim,
-                    num_cores=self.n_heads // self.num_devices,
+                    num_cores=self.attn_input_grid.num_cores,
                 )
         elif mode == Mode.PREFILL:
             return None
@@ -3735,6 +3741,9 @@ class ModelArgs:
         # Bank dial: with the weights on a bank subset each DRAM shard is 8/bank_count times wider and the reader's
         # in1 block grows with it; shrink the K block by the same factor to keep the circular buffers in L1.
         in0_block_w = self._bank_subset_in0_block_w(in0_block_w, per_core_k_tiles, n)
+        if _DRAM_MM_TRACE:
+            print(f"[dram_matmul_config] m={m} k={k} n={n} num_cores={num_cores} per_core_k_tiles={per_core_k_tiles} "
+                  f"in0_block_w={in0_block_w} per_core_M={per_core_M} per_core_N={per_core_N}", flush=True)
         return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
             in0_block_w=in0_block_w,
             per_core_M=per_core_M,
