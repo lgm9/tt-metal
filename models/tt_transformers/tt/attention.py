@@ -168,7 +168,7 @@ class Attention(LightweightModule):
         )
 
         layer_name = configuration.get_state_dict_prefix(self.__class__.__name__, layer_num)
-        if configuration.dummy_weights or (weight_cache_path is None):
+        if (configuration.dummy_weights or (weight_cache_path is None)) or os.environ.get("SPATIAL_FF_WEIGHTS_INTERLEAVED") == "1":
             cache_name = lambda _: None
         else:
             cache_name = lambda name: weight_cache_path / (f"{layer_name}.{name}")
@@ -264,6 +264,11 @@ class Attention(LightweightModule):
         wqkv_mem_config = configuration.create_dram_sharded_mem_config(
             configuration.dim, configuration.qkv_size // configuration.num_devices
         )
+        # 24: same rule as the MLP weights -- a 2D-mcast prefill matmul on a grid whose column count differs
+        # from the weight's DRAM shard count produces nan.  Gated with the MLP flag; prefill-only instances
+        # only, since the DRAM-sharded decode matmul needs the shards.
+        if os.environ.get("SPATIAL_FF_WEIGHTS_INTERLEAVED") == "1":
+            wqkv_mem_config = ttnn.DRAM_MEMORY_CONFIG
 
         qkv_list = []
         for i in range(self.num_devices_per_group):
@@ -347,6 +352,11 @@ class Attention(LightweightModule):
         wo_mem_config = configuration.create_dram_sharded_mem_config(
             (configuration.n_heads * configuration.head_dim) // configuration.num_devices, configuration.dim
         )
+        # 24: same rule as the MLP weights -- a 2D-mcast prefill matmul on a grid whose column count differs
+        # from the weight's DRAM shard count produces nan.  Gated with the MLP flag; prefill-only instances
+        # only, since the DRAM-sharded decode matmul needs the shards.
+        if os.environ.get("SPATIAL_FF_WEIGHTS_INTERLEAVED") == "1":
+            wo_mem_config = ttnn.DRAM_MEMORY_CONFIG
 
         self.shard_wo_dims = (2, 3) if (self.use_fused_all_gather_matmul or self.TG) else (3, 2)
 
@@ -787,11 +797,16 @@ class Attention(LightweightModule):
                     # causes a FATAL when the spatial sub-device manager is active.
                     # CoreCoord(0, 0) and CoreCoord(7, max_y-1) get shifted by the thread-local
                     # y_offset via the spatial_core patch, giving the correct absolute rows.
-                    import sys; print(f"[NLP_FIX] y_offset={_y_offset()} max_y={_max_y()} setting sub_core_grids rows 0-{_max_y()-1}", flush=True, file=sys.stderr)
+                    # 22: the 7 here pinned this to 8 columns whatever the partition, so a short
+                    # partition offered nlp_concat_heads_decode far fewer cores than it needs -- it wants one
+                    # output core per padded user, and 2 rows x 8 cols = 16 against a requirement of 32.
+                    # Follow the partition's real width so the extra columns are reachable.
+                    _nlp_cols = int(os.environ.get("SPATIAL_MAX_COLS", "8"))
+                    import sys; print(f"[NLP_FIX] y_offset={_y_offset()} max_y={_max_y()} cols={_nlp_cols} setting sub_core_grids", flush=True, file=sys.stderr)
                     _nlp_sub_core_grids = ttnn.CoreRangeSet({
                         ttnn.CoreRange(
                             ttnn.CoreCoord(0, 0),
-                            ttnn.CoreCoord(7, _max_y() - 1),
+                            ttnn.CoreCoord(_nlp_cols - 1, _max_y() - 1),
                         )
                     })
             except Exception:
