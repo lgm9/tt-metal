@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import torch
 
 import ttnn
@@ -143,7 +144,15 @@ class MLP(LightweightModule):
         pc_2 = self.args.get_mlp_ff2_prg_config(mode, seq_len, self.prefetcher)
         pc_3 = self.args.get_mlp_ff1_3_prg_config(mode, seq_len, self.prefetcher)
 
-        w1_out = ttnn.linear(
+        # 23: FF2 runs ttnn.experimental.minimal_matmul in prefill (seq_len > 128) and degrades 1.12x under a
+        # decode neighbour where FF1/FF3, on ttnn.linear, degrade 2.1-2.3x.  Neither fuses an activation in
+        # prefill -- SILU is applied in the silu_mul that follows -- so the same op is semantically available
+        # to them.  This routes them through it to test whether the implementation carries the spread.
+        _ff13_minimal = (os.environ.get("SPATIAL_FF13_MINIMAL") == "1" and mode == Mode.PREFILL
+                         and seq_len > 128 and not TG and self.prefetcher is None)
+        w1_out = ttnn.experimental.minimal_matmul(
+            x, self.w1, compute_kernel_config=li_ff1_3_compute_kernel_cfg, config=pc_1,
+        ) if _ff13_minimal else ttnn.linear(
             x,
             self.w1,
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
@@ -156,7 +165,9 @@ class MLP(LightweightModule):
             if self.prefetcher is not None and mode == Mode.DECODE
             else None,
         )
-        w3_out = ttnn.linear(
+        w3_out = ttnn.experimental.minimal_matmul(
+            x, self.w3, compute_kernel_config=li_ff1_3_compute_kernel_cfg, config=pc_3,
+        ) if _ff13_minimal else ttnn.linear(
             x,
             self.w3,
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,

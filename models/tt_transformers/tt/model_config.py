@@ -1631,11 +1631,27 @@ class ModelArgs:
                         num_cores=self.mlp_core_grid.num_cores,
                     )
         elif mode == Mode.PREFILL:
+            # 23: FF1/FF3 take in0_block_w = find_largest_divisor(K_tiles/grid_y) = 8, which leaves only 4 K-blocks
+            # per core, each pulling 448 in1 tiles (476 KB).  FF2 runs a different op entirely (MinimalMatmul,
+            # 8/8/8) with 56 K-blocks, and degrades 1.12x under decode against FF1/FF3's 2.1-2.3x.  This override
+            # makes the block depth testable without touching FF2.
+            _bw = os.environ.get("SPATIAL_FF13_IN0_BLOCK_W")
+            # 23: FF2 takes the MinimalMatmul branch for seq_len > 128 and degrades 1.12x under a decode
+            # neighbour where FF1/FF3 degrade 2.1-2.3x.  In prefill neither FF1 nor FF3 fuses an activation
+            # (SILU is applied in the silu_mul that follows), so the same branch is semantically available to
+            # them and this makes it testable.
+            if os.environ.get("SPATIAL_FF13_MINIMAL") == "1" and seq_len > 128:
+                _g = self.mlp1_3_grid(seq_len)
+                return ttnn.MinimalMatmulConfig(
+                    M_block_size=8, K_block_size=8, N_block_size=8,
+                    compute_with_storage_grid_size=ttnn.CoreCoord(_g[0], _g[1]),
+                )
             return self.matmul_config(
                 m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                 k=self.dim // self.cluster_shape[0],
                 n=self.hidden_dim // self.cluster_shape[1],
                 grid_size=self.mlp1_3_grid(seq_len),
+                in0_block_w=int(_bw) if _bw else None,
                 per_core_N=math.ceil(
                     (self.hidden_dim // self.cluster_shape[1]) / (ttnn.TILE_SIZE * self.dram_shard_grid_width)
                 )
