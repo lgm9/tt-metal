@@ -1652,7 +1652,12 @@ class ModelArgs:
                 n=self.hidden_dim // self.cluster_shape[1],
                 grid_size=self.mlp1_3_grid(seq_len),
                 in0_block_w=int(_bw) if _bw else None,
-                per_core_N=math.ceil(
+                # 24: per_core_N is pinned to dram_shard_grid_width (8), not to the grid, so lifting the column
+                # cap alone would leave 13 columns each still sized for an 8-column split.  With waste allowed,
+                # hand it to matmul_config, which takes ceil(n / (TILE * grid columns)).
+                per_core_N=None
+                if os.environ.get("SPATIAL_PREFILL_ALLOW_WASTE") == "1"
+                else math.ceil(
                     (self.hidden_dim // self.cluster_shape[1]) / (ttnn.TILE_SIZE * self.dram_shard_grid_width)
                 )
                 if not self.is_galaxy
@@ -3599,7 +3604,10 @@ class ModelArgs:
 
         # Cap rows to partition boundary (e.g. 5-row half-chip); fall back to arch defaults.
         max_rows = getattr(getattr(self, 'max_grid_size', None), 'y', 8 if is_wormhole_b0() else 10)
-        max_cols = 8  # Standardised: matches find_grid_k_n and DRAM-bank count on both archs
+        # 22: 8 matches the DRAM-bank count, but on a 3-row partition it caps the search at 24 cores and the
+        # scorer then picks 24, giving 4096/24 = 170.67 and a shard that is not tile-sized.  With the partition
+        # width available the scorer reaches its own target of 32, where 4096/32 = 128 is tile-legal.
+        max_cols = int(os.environ.get("SPATIAL_MAX_COLS", "8"))
         max_cores = max_rows * max_cols
 
         target = 32
@@ -3619,7 +3627,10 @@ class ModelArgs:
             )
             if not grid_ok:
                 continue
-            score = (per_core, waste, abs(cores - target))
+            # 22: rank exact division first.  hidden_dim / cores must stay a multiple of TILE_WIDTH or the
+            # downstream shard is rejected ("Shard shape {32, 124} must be tile 32x32 sized"), and a
+            # non-dividing core count with a lower per_core score used to win and produce exactly that.
+            score = (0 if waste == 0 else 1, per_core, waste, abs(cores - target))
             if best_score is None or score < best_score:
                 best_cores = cores
                 best_score = score
@@ -3644,8 +3655,19 @@ class ModelArgs:
         """
         # In matmul_config, grid_size=(rows,cols) is passed as compute_with_storage_grid_size=(x=rows,y=cols),
         # so cols maps to TTNN y (physical rows) and must respect the spatial partition height.
-        max_rows = 8
+        # 24: `rows` here is the PHYSICAL COLUMN count (the comment above records the transposition), so
+        # max_rows is the column cap.  8 is Wormhole's grid, inherited by model code never updated for
+        # Blackhole's 13x10 -- the TODO below is upstream's own note.  Lifting it only helps if the exact
+        # division just under it is also relaxed, because 128 and 448 have no divisor between 9 and 13; step 1
+        # showed a non-dividing grid is correct as long as the weight is DRAM-interleaved.
+        # scope by the caller's col_tiles, which identifies the matmul deterministically: 128 = FF1/FF3
+        # (dim/32), 448 = FF2 (hidden_dim/32), anything else = attention.  Stack inspection caught the lambda
+        # rather than the accessor and silently widened nothing.
+        _scope = os.environ.get("SPATIAL_PREFILL_SCOPE", "")
+        _wide = (not _scope) or (str(col_tiles) in _scope.split(","))
+        max_rows = int(os.environ.get("SPATIAL_PREFILL_MAX_COLS", "8")) if _wide else 8
         max_cols = min(8, getattr(getattr(self, 'max_grid_size', None), 'y', 8))
+        _allow_waste = os.environ.get("SPATIAL_PREFILL_ALLOW_WASTE") == "1" and _wide
         # TODO Improve configuration for BH (higher core grid than WH)
 
         # Find number of cols that evenly divides into the number of columns
@@ -3657,10 +3679,13 @@ class ModelArgs:
                 cols = i
                 break
 
-        for i in range(max_rows, 0, -1):
-            if row_tiles % i == 0:
-                rows = i
-                break
+        if _allow_waste:
+            rows = max_rows          # the last column carries a short tile count; ceil handles it
+        else:
+            for i in range(max_rows, 0, -1):
+                if row_tiles % i == 0:
+                    rows = i
+                    break
 
         assert cols is not None, f"Cannot find a number of columns that evenly divides into {col_tiles}, not even 1(!)."
         assert rows is not None, f"Cannot find a number of rows that evenly divides into {row_tiles}, not even 1(!)."
@@ -3687,20 +3712,27 @@ class ModelArgs:
         """
         # Cap rows to the partition height (half-chip: 5, full chip: up to 10 on BH).
         max_rows = getattr(getattr(self, 'max_grid_size', None), 'y', 8 if is_wormhole_b0() else 10)
-        max_cols = 8  # Matches find_grid and the 8-bank DRAM layout on both archs
+        # 22: the 8 matches the DRAM bank layout, but on a short partition it caps the core count below what
+        # the padded batch needs (3 rows x 8 = 24 against 32).  Follow the partition width when it is wider,
+        # and prefer a core count that divides the N-tile count so the shard stays tile-sized.
+        max_cols = int(os.environ.get("SPATIAL_MAX_COLS", "8"))
         max_cores = max_rows * max_cols  # Maximum number of cores
 
         # All core counts are candidates; ceiling arithmetic handles non-divisible K/N.
         possible_cores = list(range(1, max_cores + 1))
         possible_cores.sort(reverse=True)  # Start checking from the largest number of cores
 
-        for cores in possible_cores:
-            # Try to find a grid configuration with the current number of cores
-            for rows in range(1, max_rows + 1):
-                if cores % rows == 0:
-                    cols = cores // rows
-                    if cols <= max_cols:
-                        return rows, cols
+        # prefer core counts that divide N in tiles, so 4096/cores stays a multiple of TILE_WIDTH
+        _n_tiles = max(1, N)
+        for _pref in (True, False):
+            for cores in possible_cores:
+                if _pref and (_n_tiles % cores) != 0:
+                    continue
+                for rows in range(1, max_rows + 1):
+                    if cores % rows == 0:
+                        cols = cores // rows
+                        if cols <= max_cols:
+                            return rows, cols
 
         # If no configuration is found, assert an error
         raise AssertionError(

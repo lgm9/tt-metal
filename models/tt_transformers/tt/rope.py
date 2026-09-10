@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -504,10 +505,12 @@ class RotarySetup(LightweightModule):
                         row_wise=True,
                     )
                 else:
-                    # One core per batch element, 8 cols wide; cap at 8 rows (64 cores max).
-                    # Avoids allocating 64 cores for batch=32 (upstream % 32 check is too coarse).
-                    _bh_rows = min(math.ceil(batch_size / 8), 8)
-                    return ttnn.CoreGrid(y=_bh_rows, x=8)
+                    # One core per batch element.  22: the 8 here was pinned regardless of the
+                    # partition, so a short partition could not supply enough cores -- 3 rows x 8 = 24
+                    # against a batch of 32.  Follow the partition width so the extra columns count.
+                    _cols = int(os.environ.get("SPATIAL_MAX_COLS", "8"))
+                    _bh_rows = min(math.ceil(batch_size / _cols), 8)
+                    return ttnn.CoreGrid(y=_bh_rows, x=_cols)
             else:
                 return ttnn.num_cores_to_corerangeset(batch_size, core_grid, row_wise=True)
 
