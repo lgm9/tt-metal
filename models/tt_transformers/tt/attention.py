@@ -811,11 +811,30 @@ class Attention(LightweightModule):
                     })
             except Exception:
                 pass
-        attn_output_cat = ttnn.experimental.nlp_concat_heads_decode(
-            attn_output_11BH,
-            num_heads=self.n_local_heads,
-            sub_core_grids=_nlp_sub_core_grids,
-        )
+        # 22: nlp_concat_heads_decode pads the batch to 32 and asks for one output core per padded user, so a
+        # partition with fewer than 32 cores cannot run it at all (2 rows give at most 26 on a 13-wide chip).
+        # The op is semantically a reshape -- the input is [1, batch, padded_heads, head_dim] with each user's
+        # heads contiguous, and the output is [1, 1, batch, heads*head_dim] -- so on a partition too small for
+        # the fused op, compose the same thing out of a de-shard and a reshape.  Slower, but it exists.
+        _cores_avail = (_nlp_sub_core_grids.num_cores() if _nlp_sub_core_grids is not None else 32)
+        if os.environ.get("SPATIAL_NLP_CONCAT_FALLBACK") == "1" and _cores_avail < 32:
+            _b = attn_output_11BH.shape[1]
+            _hd = attn_output_11BH.shape[-1]
+            _x = ttnn.to_memory_config(attn_output_11BH, ttnn.DRAM_MEMORY_CONFIG)
+            _x = ttnn.reshape(_x, (1, 1, _b, self.n_local_heads * _hd))
+            # the fused op returns a sharded tensor; the consumer (the wo matmul, via
+            # SHARDED_ATTN_INPUT_MEMCFG) needs the same layout, so put it back on the shard the model expects
+            # instead of handing on a DRAM-interleaved tensor.
+            _tgt = self.model_config.get("SHARDED_ATTN_INPUT_MEMCFG")
+            if _tgt is not None:
+                _x = ttnn.to_memory_config(_x, _tgt)
+            attn_output_cat = _x
+        else:
+            attn_output_cat = ttnn.experimental.nlp_concat_heads_decode(
+                attn_output_11BH,
+                num_heads=self.n_local_heads,
+                sub_core_grids=_nlp_sub_core_grids,
+            )
         _attn_sync("after nlp_concat")
         ttnn.deallocate(attn_output_11BH)
         ttnn.deallocate(attn_output_1G4D)
