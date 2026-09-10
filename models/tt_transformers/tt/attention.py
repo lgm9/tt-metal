@@ -818,9 +818,18 @@ class Attention(LightweightModule):
         # the fused op, compose the same thing out of a de-shard and a reshape.  Slower, but it exists.
         _cores_avail = (_nlp_sub_core_grids.num_cores() if _nlp_sub_core_grids is not None else 32)
         if os.environ.get("SPATIAL_NLP_CONCAT_FALLBACK") == "1" and _cores_avail < 32:
+            # The fused op pads the batch to 32 before reshaping, and the padding is load-bearing: the shard
+            # height must be a whole tile and the residual add downstream broadcasts against a 32-row operand
+            # ("Invalid subtile broadcast type" at batch 8 without it).  Reproduce that padding here.  The
+            # CORE COUNT is a separate matter -- the op takes 32 only because it chose shard width = head_dim,
+            # and {32, 2*head_dim} over 16 cores is equally tile-legal -- so the reshard below is free to use
+            # whatever count divides the tile row and fits the partition.
             _b = attn_output_11BH.shape[1]
             _hd = attn_output_11BH.shape[-1]
             _x = ttnn.to_memory_config(attn_output_11BH, ttnn.DRAM_MEMORY_CONFIG)
+            if _b < 32:
+                _x = ttnn.pad(_x, [(0, 0), (0, 32 - _b), (0, 0), (0, 0)], value=0.0)
+                _b = 32
             _x = ttnn.reshape(_x, (1, 1, _b, self.n_local_heads * _hd))
             # the fused op returns a sharded tensor; the consumer (the wo matmul, via
             # SHARDED_ATTN_INPUT_MEMCFG) needs the same layout, so put it back on the shard the model expects
