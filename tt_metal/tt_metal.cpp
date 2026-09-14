@@ -1387,7 +1387,8 @@ KernelHandle CreateKernel(
     if (!(core_ranges == requested_ranges)) {
         // Confined: let the kernel map the factory's partition-relative core coordinates.
         uint32_t y0 = 0, y = 0;
-        spatial_shift_active(y0, y);
+        bool _forced = false;
+        spatial_shift_active(y0, y, _forced);
         program.impl().get_kernel(kernel)->set_spatial_row_shift(y0, y);
     }
 
@@ -1431,7 +1432,8 @@ KernelHandle CreateKernelFromString(
         config);
     if (!(core_ranges == requested_ranges)) {
         uint32_t y0 = 0, y = 0;
-        spatial_shift_active(y0, y);
+        bool _forced = false;
+        spatial_shift_active(y0, y, _forced);
         program.impl().get_kernel(kernel)->set_spatial_row_shift(y0, y);
     }
     return kernel;
