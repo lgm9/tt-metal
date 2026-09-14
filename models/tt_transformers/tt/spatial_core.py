@@ -47,6 +47,7 @@ import ctypes
 import threading
 from typing import Any
 
+import os
 import ttnn
 
 # ── C++ thread-local compute-grid override ─────────────────────────────────────
@@ -135,10 +136,15 @@ def set_spatial_partition(y_offset: int = 0, max_y: int = 10,
     # would expose those dispatch columns to program compilation, causing
     # "Kernel group cores do not match sub device cores" when sub-devices only
     # cover columns 0-7. Always explicitly restrict to (min(max_x,8), max_y).
+    # 24: the comment above is wrong -- 17 read blackhole_140_arch.yaml and found dispatch on the last column
+    # of the FUNCTIONAL grid, outside the 130-core compute grid, with zero dispatch cores in columns 8-12.  What
+    # survives is circular: exposing them breaks against sub-devices that cover only 0-7, and those are 8 wide
+    # because of GRID_X.  Lift both together or neither.
+    _cap = int(os.environ.get("SPATIAL_MAX_COLS", "8"))
     if _cpp_set_grid_v2 is not None:
-        _cpp_set_grid_v2(min(max_x, 8), max_y, y_offset)
+        _cpp_set_grid_v2(min(max_x, _cap), max_y, y_offset)
     elif _cpp_set_grid is not None:
-        _cpp_set_grid(min(max_x, 8), max_y)
+        _cpp_set_grid(min(max_x, _cap), max_y)
 
 
 def clear_spatial_partition() -> None:
@@ -243,6 +249,19 @@ def install_patches() -> None:
             else:
                 new_x = x
                 new_y = min(y, _max_y())
+                # 51: the clamp is a CAP standing in for an ALIGNMENT TEST.  lm_head_core_grid is built as
+                # CoreGrid(y=4, x=8) without reference to the partition, and min(4, rows) gives 24 cores at
+                # three rows -- the one value in the set that does not tile the model dimension
+                # (4096/24 = 170.67), which is why the sharded layernorm rejects a three-row partition with
+                # "Block width * tile_width must match shard shape[1], got 192 vs 170".
+                #
+                # Replace the cap with the test: take the largest y that FITS and still DIVIDES the original
+                # grid's core count.  A core count that divides the original tiles anything the original
+                # tiled, so this needs no tensor dimension, and at four rows and above y is already 4 and 4
+                # divides 4, so nothing there can move.  Three rows goes 24 -> 16 cores.
+                if os.environ.get("SPATIAL_GRID_TILE_ALIGN") == "1" and new_y < y:
+                    while new_y > 1 and y % new_y != 0:
+                        new_y -= 1
             return _orig_CoreGrid(x=new_x, y=new_y)
 
     ttnn.CoreGrid = _SpatialCoreGrid

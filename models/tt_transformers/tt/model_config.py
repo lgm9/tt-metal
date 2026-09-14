@@ -3635,6 +3635,18 @@ class ModelArgs:
                 best_cores = cores
                 best_score = score
 
+        # 52: the exact-divisor rule throws away whole rows to keep the division clean.  At three rows it
+        # takes 16 of 24 cores, and the feed-forward's per_core_N is then 28 instead of the 19 that 24 cores
+        # would carry with eight tiles of overhang -- and the circular buffers scale with per_core_N.  When no
+        # exact divisor uses the WHOLE partition, take the whole partition and accept the overhang.  Precedent:
+        # SPATIAL_PREFILL_ALLOW_WASTE already does this for prefill, and 45 used it at 12 and 13 columns.
+        # Independent of 51's gate so the two can be tested apart.  Some cores then compute discarded columns,
+        # so every completed run carries a PCC.
+        if os.environ.get("SPATIAL_GRID_ALLOW_WASTE") == "1" and best_cores is not None:
+            _full = max_rows * max_cols
+            if best_cores < _full:
+                best_cores = _full
+
         if best_cores is None:
             raise AssertionError(
                 f"Cannot find a grid configuration for {N} tiles within {max_rows}×{max_cols} "
@@ -3786,6 +3798,19 @@ class ModelArgs:
             "per_core_N arithmetic overflow — should not happen"
         )
         in0_block_w = self.find_largest_divisor(per_core_k_tiles)
+        # 53 step 1, MEASUREMENT ONLY: the circular-buffer total is only ever printed by the overflow
+        # assertion, so the way to decompose it is to move one parameter and read the new total.  46 proved
+        # this knob changes the ANSWER (logit PCC 0.597), so nothing timed or numerical may be quoted from a
+        # run with it set -- these builds are never executed.
+        _ibw_probe = int(os.environ.get("SPATIAL_PROBE_IN0_BLOCK_W", "0"))
+        # 54: the operator is numerically free in in0_block_w (PCC 0.99995 across 8/4/2) and the model is not
+        # (0.588).  n identifies the op deterministically -- 14336 = FF1/FF3, 4096 = FF2 and wo, 6144 = wqkv,
+        # 16032 = the head -- so scoping the override says which op cannot take the parameter.
+        _scope = os.environ.get("SPATIAL_PROBE_IBW_SCOPE", "")
+        if _scope and str(n) not in _scope.split(","):
+            _ibw_probe = 0
+        if _ibw_probe and per_core_k_tiles % _ibw_probe == 0:
+            in0_block_w = _ibw_probe
         # Bank dial: with the weights on a bank subset each DRAM shard is 8/bank_count times wider and the reader's
         # in1 block grows with it; shrink the K block by the same factor to keep the circular buffers in L1.
         in0_block_w = self._bank_subset_in0_block_w(in0_block_w, per_core_k_tiles, n)
