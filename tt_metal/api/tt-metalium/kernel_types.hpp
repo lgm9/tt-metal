@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <optional>
 #include <cstdint>
 #include <map>
@@ -124,6 +126,21 @@ struct ComputeConfig {
 namespace detail {
 
 inline NOC preferred_noc_for_dram_read(ARCH arch) {
+    // 61: swept so the null is recorded rather than left for a reviewer.  60 measured the interleaved
+    // route's ceiling at ~24 GB/s per reader against the sharded route's 43.4, and located the cause in
+    // outstanding reads (one block in flight against three behind four transaction ids) rather than in the
+    // fabric.  One stream on either NoC is still one stream, so moving the read to NOC_1 is expected to
+    // change nothing; SPATIAL_DRAM_READ_NOC=1 makes that testable instead of assumed.  Default unchanged.
+    static const int forced = [] {
+        const char* e = std::getenv("SPATIAL_DRAM_READ_NOC");
+        return (e && (e[0] == '0' || e[0] == '1')) ? (e[0] - '0') : -1;
+    }();
+    if (forced == 0) {
+        return NOC::NOC_0;
+    }
+    if (forced == 1) {
+        return NOC::NOC_1;
+    }
     switch (arch) {
         case ARCH::WORMHOLE_B0:
         default: return NOC::NOC_0;
@@ -131,6 +148,20 @@ inline NOC preferred_noc_for_dram_read(ARCH arch) {
 }
 
 inline NOC preferred_noc_for_dram_write(ARCH arch) {
+    // 61: the companion to SPATIAL_DRAM_READ_NOC.  The two NoCs are ALREADY both in use -- reads default to
+    // NOC_0 and writes to NOC_1 -- so moving the read alone puts two data movement kernels on one core
+    // sharing a NoC, which deadlocks (measured: a silent hang, no assertion).  The meaningful test is the
+    // SWAP, read on NOC_1 and write on NOC_0, which stays legal and is identical if the fabric is symmetric.
+    static const int forced = [] {
+        const char* e = std::getenv("SPATIAL_DRAM_WRITE_NOC");
+        return (e && (e[0] == '0' || e[0] == '1')) ? (e[0] - '0') : -1;
+    }();
+    if (forced == 0) {
+        return NOC::NOC_0;
+    }
+    if (forced == 1) {
+        return NOC::NOC_1;
+    }
     switch (arch) {
         case ARCH::WORMHOLE_B0:
         default: return NOC::NOC_1;
