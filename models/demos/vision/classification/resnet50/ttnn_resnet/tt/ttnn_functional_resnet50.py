@@ -437,12 +437,26 @@ class resnet50:
         if is_blackhole() and self.batch_size == 32:
             act_block_h_override = 32 * 32 if is_blackhole_p100(device) else 49 * 32
 
+        # 70: inside a row band the divisor search over nhw_ntiles (6272 = 2^7 x 7^2 at batch 16)
+        # collapses 7, 6 and 5 rows all onto 64 cores, doubling the per-core shard against the
+        # unpartitioned 128 and overflowing L1 by 119168 B -- 9 %, not a factor of two.  These two
+        # are the documented levers for exactly that: the double buffer's own header says "Doubles
+        # the size of the CBs for activation.  Increased perf, but increased L1 usage."  Both are
+        # env-gated and default to the stock values, so an unbanded run is unchanged.
+        import os as _os
+
+        _dbl = _os.environ.get("SPATIAL_RESNET_ACT_DBL")
+        _abh = _os.environ.get("SPATIAL_RESNET_ACT_BLOCK_H")
+        _enable_act_dbl = True if _dbl is None else (_dbl == "1")
+        if _abh is not None:
+            act_block_h_override = int(_abh)
+
         self.conv1_config = ttnn.Conv2dConfig(
             weights_dtype=self.model_config["WEIGHTS_DTYPE"],
             activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
             deallocate_activation=dealloc_input,
             act_block_h_override=act_block_h_override,
-            enable_act_double_buffer=True,
+            enable_act_double_buffer=_enable_act_dbl,
             shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
             reshard_if_not_optimal=False,
             # otherwise act block h is not big enough for the reuse
